@@ -180,6 +180,7 @@ class Task:
         envs: Optional[Dict[str, str]] = None,
         workdir: Optional[str] = None,
         num_nodes: Optional[int] = None,
+        depends_on: Optional[List[str]] = None,
         # Advanced:
         docker_image: Optional[str] = None,
         event_callback: Optional[str] = None,
@@ -235,6 +236,8 @@ class Task:
             setup/run command, where ``run`` can either be a str, meaning all
             nodes get the same command, or a lambda, with the semantics
             documented above.
+          depends_on: A list of dependencies. A dependency is a task name followed
+            by a file name, seperated by a colon.
           docker_image: (EXPERIMENTAL: Only in effect when LocalDockerBackend
             is used.) The base docker image that this Task will be built on.
             Defaults to 'gpuci/miniforge-cuda:11.4-devel-ubuntu18.04'.
@@ -248,6 +251,7 @@ class Task:
         self.setup = setup
         self._envs = envs or {}
         self.workdir = workdir
+        self.depends_on = depends_on
         self.docker_image = (docker_image if docker_image else
                              'gpuci/miniforge-cuda:11.4-devel-ubuntu18.04')
         self.event_callback = event_callback
