@@ -1,0 +1,16 @@
+name: task1
+
+resources:
+  cloud: aws
+
+workdir: .
+
+setup: |
+  pip install -r requirements.txt
+
+dependson:
+  preprocess:
+    - train.csv
+
+run: |
+  python3 preprocess.py

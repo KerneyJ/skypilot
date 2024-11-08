@@ -1,0 +1,14 @@
+name: task1
+
+resources:
+  cloud: aws
+
+workdir: .
+
+setup: |
+  pip install -r requirements.txt
+
+# Typical use: make use of resources, such as running training.
+# Invoked under the workdir (i.e., can use its files).
+run: |
+  python3 preprocess.py
