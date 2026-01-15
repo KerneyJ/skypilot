@@ -627,6 +627,11 @@ class ServeUpdateBody(RequestBody):
         return kwargs
 
 
+class ServeUpdateIntermeshBody(RequestBody):
+    """The request body for the serve update-intermesh endpoint."""
+    service_name: str
+
+
 class ServeDownBody(RequestBody):
     """The request body for the serve down endpoint."""
     service_names: Optional[Union[str, List[str]]]

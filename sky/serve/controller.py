@@ -263,6 +263,26 @@ class SkyServeController:
             return responses.JSONResponse(status_code=200,
                                           content={'message': message})
 
+        @self._app.post('/controller/install_intermesh')
+        async def install_intermesh(
+                request: fastapi.Request) -> fastapi.Response:
+            """Install Intermesh on controller and all replicas."""
+            try:
+                result = self._replica_manager.install_intermesh()
+                return responses.JSONResponse(
+                    content={'message': 'Success', 'result': result},
+                    status_code=200)
+            except Exception as e:
+                exception_str = common_utils.format_exception(e)
+                logger.error(f'Error in install_intermesh: {exception_str}')
+                return responses.JSONResponse(
+                    content={
+                        'message': 'Error',
+                        'exception': exception_str,
+                        'traceback': traceback.format_exc()
+                    },
+                    status_code=500)
+
         @self._app.exception_handler(Exception)
         async def validation_exception_handler(
                 request: fastapi.Request, exc: Exception) -> fastapi.Response:

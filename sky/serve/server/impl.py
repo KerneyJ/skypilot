@@ -11,6 +11,7 @@ import uuid
 
 import colorama
 import filelock
+import requests
 
 from sky import backends
 from sky import exceptions
@@ -266,6 +267,63 @@ def up(
         # task CPU usage to custom value instead of default 0.5 vCPU. We need
         # to set it to a smaller value to support a larger number of services.
         controller_task.service_name = service_name
+
+        # Inject Intermesh metadata for SkyServe controller
+        # Check task-level intermesh config from user's task (replica task),
+        # then fall back to global config
+        user_resources = task.resources  # User's task, not controller_task
+        base_intermesh_config = {}
+        intermesh_enabled = False
+
+        # Check intermesh config from user's task resources
+        if user_resources:
+            for r in user_resources:
+                task_intermesh = r.cluster_config_overrides.get('intermesh', {})
+                if task_intermesh.get('enabled', False):
+                    intermesh_enabled = True
+                    base_intermesh_config = task_intermesh
+                    break
+
+        # Fall back to global config if not found in user's task
+        if not intermesh_enabled:
+            intermesh_enabled = skypilot_config.get_nested(('intermesh', 'enabled'), False)
+            if intermesh_enabled:
+                base_intermesh_config = skypilot_config.get_nested(('intermesh',), {})
+
+        if intermesh_enabled:
+            intermesh_config_with_metadata = dict(base_intermesh_config)
+            intermesh_config_with_metadata['cluster_metadata'] = {
+                'deployment_type': 'serve',
+                'cluster_type': 'controller',
+                'service_name': service_name,
+            }
+            # Update resources to include intermesh config with metadata
+            resources = controller_task.resources
+            if resources:
+                for r in resources:
+                    # Access the underlying _cluster_config_overrides directly
+                    if r._cluster_config_overrides is None:
+                        r._cluster_config_overrides = {}
+
+                    # Structure must be: {intermesh: {...}} at top level
+                    r._cluster_config_overrides['intermesh'] = (
+                        intermesh_config_with_metadata)
+
+            # Add intermesh initialization command to controller setup
+            # Controller needs to run: intermesh sky up --serve {service_name} {public_ip}
+            # This runs AFTER bootstrap, so intermesh daemon is already running
+            # Controller discovers its own public IP via GCP metadata service
+            intermesh_init_cmd = (
+                f'PUBLIC_IP=$(curl -s -H "Metadata-Flavor: Google" '
+                f'http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip) && '
+                f'sudo intermesh sky up --serve {service_name} $PUBLIC_IP'
+            )
+
+            # Add to controller task's setup commands
+            if controller_task.setup:
+                controller_task.setup += f'\n{intermesh_init_cmd}'
+            else:
+                controller_task.setup = intermesh_init_cmd
 
         # We directly submit the request to the controller and let the
         # controller to check name conflict. Suppose we have multiple
@@ -707,6 +765,73 @@ def apply(
         except exceptions.ClusterNotUpError:
             pass
         up(task, service_name, pool)
+
+
+def update_intermesh(service_name: str, pool: bool) -> Dict[str, Any]:
+    """Install Intermesh on an existing service.
+
+    This function retrofits Intermesh onto a service that was deployed without
+    it, enabling E2E encryption between the controller and replicas.
+
+    Args:
+        service_name: Name of the service.
+        pool: Whether this is a pool (not supported).
+
+    Returns:
+        Dict with installation results per component:
+        {
+            'controller': {'status': 'success'|'failed'|'skipped', 'imid': '...'},
+            'replicas': {replica_id: {'status': '...', 'imid': '...', 'error': '...'}, ...}
+        }
+
+    Raises:
+        AssertionError: if pool is True (not supported for pools)
+        exceptions.ClusterNotUpError: if controller is not up
+    """
+    assert not pool, 'Intermesh update not supported for pools'
+
+    # Get service status to verify service exists
+    service_records = status([service_name], pool=pool)
+    if not service_records:
+        raise ValueError(f'Service {service_name!r} not found.')
+
+    # Get controller handle
+    controller_type = controller_utils.get_controller_for_pool(pool)
+    handle = backend_utils.is_controller_accessible(
+        controller=controller_type,
+        stopped_message=f'Service {service_name!r} controller is not up.')
+
+    assert isinstance(handle, backends.CloudVmRayResourceHandle)
+    backend = backend_utils.get_backend_from_handle(handle)
+    assert isinstance(backend, backends.CloudVmRayBackend)
+
+    # Run install_intermesh on the controller via SSH
+    code = serve_utils.ServeCodeGen.install_intermesh(service_name)
+    returncode, result_payload, stderr = backend.run_on_head(
+        handle,
+        code,
+        require_outputs=True,
+        stream_logs=False,
+        separate_stderr=True)
+
+    try:
+        subprocess_utils.handle_returncode(
+            returncode,
+            code,
+            'Failed to install Intermesh',
+            stderr,
+            stream_logs=True)
+    except exceptions.CommandError as e:
+        raise RuntimeError(e.error_msg) from e
+
+    # Parse result
+    import json
+    try:
+        return json.loads(result_payload)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f'Failed to parse Intermesh installation result: {result_payload}'
+        ) from e
 
 
 def down(

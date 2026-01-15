@@ -64,6 +64,52 @@ def up(
         return server_common.get_request_id(response)
 
 
+def _is_intermesh_only_update(yaml_content: str) -> bool:
+    """Check if update is only enabling intermesh.
+
+    Returns True if YAML contains only intermesh configuration
+    (and optionally config/cluster_config_overrides), with no
+    other significant fields like resources, run, service, etc.
+
+    Args:
+        yaml_content: The YAML content as a string.
+
+    Returns:
+        True if this is an intermesh-only update, False otherwise.
+    """
+    try:
+        import yaml
+        from sky import sky_logging
+
+        logger = sky_logging.init_logger(__name__)
+        config = yaml.safe_load(yaml_content)
+
+        # Must have intermesh key
+        if 'intermesh' not in config:
+            return False
+
+        # Check allowed keys (these don't trigger full update)
+        allowed_keys = {'intermesh', 'config', 'cluster_config_overrides'}
+        actual_keys = set(config.keys())
+
+        # If any other keys present, it's a full update
+        significant_keys = actual_keys - allowed_keys
+        if significant_keys:
+            return False
+
+        # Intermesh must be enabled
+        intermesh_config = config.get('intermesh', {})
+        if not intermesh_config.get('enabled', False):
+            return False
+
+        return True
+    except Exception as e:
+        from sky import sky_logging
+        logger = sky_logging.init_logger(__name__)
+        logger.warning(f'Failed to parse update yaml file: {e}')
+        return False
+
+
 def update(
     task: Union['sky.Task', 'sky.Dag'],
     service_name: str,
@@ -76,9 +122,24 @@ def update(
     assert not pool, 'Command `update` is not supported for pool.'
     # Avoid circular import.
     from sky.client import sdk  # pylint: disable=import-outside-toplevel
+    from sky import sky_logging
+
+    logger = sky_logging.init_logger(__name__)
     noun = 'pool' if pool else 'service'
 
     dag = dag_utils.convert_entrypoint_to_dag(task)
+
+    # Get YAML content for detection
+    dag_str = dag_utils.dump_chain_dag_to_yaml_str(dag)
+
+    # Special case: intermesh-only update
+    # Skip normal validation/replacement and just install intermesh
+    if _is_intermesh_only_update(dag_str):
+        logger.info('Detected intermesh-only update. Installing Intermesh '
+                   'without replica replacement...')
+        return update_intermesh(service_name, pool, _need_confirmation)
+
+    # Normal update flow continues...
     with admin_policy_utils.apply_and_use_config_in_current_request(
             dag,
             request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE,
@@ -93,6 +154,7 @@ def update(
                           show_default=True)
 
         dag = client_common.upload_mounts_to_api_server(dag)
+        # Re-serialize after upload_mounts (dag may have been modified)
         dag_str = dag_utils.dump_chain_dag_to_yaml_str(dag)
 
         body = payloads.ServeUpdateBody(
@@ -107,6 +169,79 @@ def update(
             json=json.loads(body.model_dump_json()),
             timeout=(5, None))
         return server_common.get_request_id(response)
+
+
+def update_intermesh(
+    service_name: str,
+    pool: bool = False,
+    yes: bool = False
+) -> server_common.RequestId[Dict[str, Any]]:
+    """Install Intermesh on an existing service.
+
+    This function retrofits Intermesh onto a service that was deployed without
+    it, enabling E2E encryption between the controller and replicas.
+
+    Args:
+        service_name: Name of the service.
+        pool: Whether this is a pool (not supported).
+        yes: Skip confirmation prompt.
+
+    Returns:
+        The request ID of the installation operation.
+
+    Raises:
+        ValueError: if service doesn't exist or is not in READY status
+        AssertionError: if pool is True (not supported for pools)
+    """
+    from sky import sky_logging
+    from sky.client import sdk  # pylint: disable=import-outside-toplevel
+    from sky.serve import serve_state
+
+    logger = sky_logging.init_logger(__name__)
+    assert not pool, 'Command `update intermesh` is not supported for pool.'
+
+    # Get service status to validate it exists
+    status_request_id = status([service_name], pool=False)
+    services = sdk.get(status_request_id)
+
+    if not services:
+        raise ValueError(f'Service {service_name!r} not found.')
+
+    service_info = services[0]
+
+    # Check if service is in a good state
+    # service_info['status'] returns a string like 'READY', 'FAILED', etc.
+    status_str = str(service_info['status'])
+    # Handle both enum string format (ServiceStatus.READY) and plain string (READY)
+    is_ready = 'READY' in status_str
+    if not is_ready:
+        raise ValueError(
+            f'Service {service_name!r} is in status {service_info["status"]}. '
+            'Can only install Intermesh on services in READY status.')
+
+    # Confirmation prompt
+    if not yes:
+        replica_count = len(service_info.get('replica_info', []))
+        click.confirm(
+            f'This will install Intermesh on service {service_name!r} '
+            f'(1 controller + {replica_count} replicas). Proceed?',
+            default=True,
+            abort=True,
+            show_default=True)
+
+    # Create request body
+    body = payloads.ServeUpdateIntermeshBody(
+        service_name=service_name,
+    )
+
+    # Send to API server
+    response = server_common.make_authenticated_request(
+        'POST',
+        '/serve/update-intermesh',
+        json=json.loads(body.model_dump_json()),
+        timeout=(5, None))
+
+    return server_common.get_request_id(response)
 
 
 def apply(

@@ -3350,6 +3350,294 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                                  handle.launched_resources.ports,
                                  provider_config)
 
+    def _get_instance_imid(self, instance_name: str, zone: str,
+                           max_retries: int = 10) -> Optional[str]:
+        """Get IMID from a GCP instance via SSH.
+
+        Args:
+            instance_name: GCP instance name
+            zone: GCP zone
+            max_retries: Maximum number of retry attempts
+
+        Returns:
+            IMID string or None if failed
+        """
+        import subprocess
+        import time
+
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run([
+                    'gcloud', 'compute', 'ssh', instance_name, '--zone', zone,
+                    '--command', 'sudo intermesh sky my-imid'
+                ],
+                                        check=True,
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=30)
+                node_imid = result.stdout.strip()
+                if node_imid:
+                    return node_imid
+            except subprocess.CalledProcessError:
+                if attempt < max_retries - 1:
+                    logger.debug(
+                        f'my-imid not ready on {instance_name}, retrying... '
+                        f'(attempt {attempt + 1}/{max_retries})')
+                    time.sleep(5)
+                else:
+                    logger.warning(
+                        f'Failed to get IMID from {instance_name} after '
+                        f'{max_retries} attempts')
+                    return None
+            except subprocess.TimeoutExpired:
+                logger.warning(f'Timeout getting IMID from {instance_name}')
+                return None
+
+        return None
+
+    def _configure_intermesh_endorsements(
+            self, handle: CloudVmRayResourceHandle) -> None:
+        """Configure Intermesh endorsements after cluster provisioning.
+
+        Uses the new sky module commands to register nodes with controller.
+        """
+        import time
+        import subprocess
+        from sky import skypilot_config
+
+        # Check if Intermesh is enabled
+        config = global_user_state.get_cluster_yaml_dict(handle.cluster_yaml)
+        if config is None:
+            logger.debug('Cluster config not found, skipping Intermesh configuration')
+            return
+
+        provider_config = config.get('provider', {}) or {}
+        intermesh_config = provider_config.get('intermesh', {})
+
+        if not intermesh_config:
+            global_config = skypilot_config.get_nested(('intermesh',), {})
+            intermesh_config = global_config if isinstance(global_config, dict) else {}
+
+        if not intermesh_config or not intermesh_config.get('enabled', False):
+            logger.debug('Intermesh not enabled, skipping endorsement configuration')
+            return
+
+        logger.info('Configuring Intermesh endorsements for cluster nodes...')
+
+        # Get intermesh binary path
+        intermesh_binary = intermesh_config.get('binary_path', '/usr/bin/intermesh')
+        cluster_name_on_cloud = handle.cluster_name_on_cloud
+
+        # Get cloud suffix dynamically
+        cloud = handle.launched_resources.cloud
+        cloud_suffix = str(cloud).lower()  # e.g., 'gcp', 'aws', 'azure'
+
+        # Read cluster metadata from intermesh config (if present)
+        cluster_metadata = intermesh_config.get('cluster_metadata', {})
+        cluster_type = cluster_metadata.get('cluster_type')
+        deployment_type = cluster_metadata.get('deployment_type')
+
+        # Check if laptop has intermesh daemon running (for monitoring)
+        laptop_imid = None
+        if deployment_type == 'serve' and cluster_type == 'controller':
+            try:
+                # FIXME(kerneyj): This needs 'sudo' to work - intermesh daemon requires elevated privileges
+                laptop_imid = subprocess.check_output([intermesh_binary, 'sky', 'my-imid'],
+                                                       text=True,
+                                                       stderr=subprocess.PIPE).strip()
+                logger.info('Laptop has Intermesh daemon - will enable monitoring')
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                logger.info('Laptop does not have Intermesh daemon - monitoring disabled')
+                laptop_imid = None
+
+        # Determine cluster_params based on cluster metadata
+        if cluster_type == 'controller':
+            # Controller cluster - use service_name without cloud suffix (for --serve flag)
+            service_name = cluster_metadata['service_name']
+            cluster_params = service_name  # No cloud suffix for serve mode
+            logger.info(f'SkyServe controller for service: {service_name}')
+        elif cluster_type == 'replica':
+            # Replica cluster - use service_name without cloud suffix (for --serve flag)
+            service_name = cluster_metadata['service_name']
+            replica_id = cluster_metadata['replica_id']
+            cluster_params = service_name  # No cloud suffix for serve mode
+            logger.info(f'SkyServe replica {replica_id} for service: {service_name}')
+        else:
+            # Regular cluster - standard naming (cluster_type is None or missing)
+            cluster_params = f"{cluster_name_on_cloud}.{cloud_suffix}"
+            logger.info(f'Regular cluster: {cluster_name_on_cloud}')
+
+        # Initialize controller with appropriate command based on deployment type
+        if deployment_type == 'cluster':
+            # Regular cluster mode - use sky up command
+            try:
+                # FIXME(kerneyj): This needs 'sudo' to work - intermesh daemon requires elevated privileges
+                subprocess.run(
+                    [intermesh_binary, 'sky', 'up', cluster_params],
+                    check=True,
+                    capture_output=True)
+                logger.info(f'Controller initialized for cluster: {cluster_params}')
+            except subprocess.CalledProcessError as e:
+                logger.warning(f'Failed to initialize controller: {e}')
+                logger.warning(
+                    'Skipping Intermesh endorsements (continuing without Intermesh)'
+                )
+                return
+        elif deployment_type == 'serve':
+            # SkyServe mode - controller self-initializes, laptop does nothing here
+            logger.info('SkyServe mode: controller will self-initialize via setup script')
+        else:
+            logger.warning(
+                f'Unknown deployment_type: {deployment_type}, skipping Intermesh configuration intermesh config: {intermesh_config}'
+            )
+            return
+
+        # Query GCP for cluster instances
+        logger.info('Discovering cluster nodes...')
+        instances = []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run(
+                    ['gcloud', 'compute', 'instances', 'list',
+                     f'--filter=name:{cluster_name_on_cloud}-*',
+                     '--format=value(name,zone,networkInterfaces[0].accessConfigs[0].natIP)'],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        parts = line.split('\t')
+                        if len(parts) == 3:
+                            instance_name, zone, external_ip = parts
+                            instances.append((instance_name, zone, external_ip))
+
+                if instances:
+                    logger.info(f'Found {len(instances)} cluster instances')
+                    break
+                elif attempt < max_retries - 1:
+                    logger.info(f'No instances found yet, retrying... (attempt {attempt + 1}/{max_retries})')
+                    time.sleep(5)
+            except subprocess.CalledProcessError as e:
+                if attempt < max_retries - 1:
+                    logger.info(f'Failed to list instances, retrying... (attempt {attempt + 1}/{max_retries})')
+                    time.sleep(5)
+                else:
+                    logger.warning(f'Failed to list cluster instances: {e}')
+                    return
+
+        if not instances:
+            logger.warning('No instances found after retries')
+            return
+
+        # For SkyServe controller, register laptop as monitor if available
+        if deployment_type == 'serve' and cluster_type == 'controller':
+            service_name = cluster_metadata['service_name']
+
+            # Find controller node (head node)
+            controller_imid = None
+            controller_ip = None
+            controller_instance = None
+            controller_zone = None
+            for instance_name, zone, external_ip in instances:
+                if '-head-' in instance_name:
+                    # Get controller IMID using helper function
+                    controller_imid = self._get_instance_imid(
+                        instance_name, zone)
+                    if controller_imid:
+                        controller_ip = external_ip
+                        controller_instance = instance_name
+                        controller_zone = zone
+                        break
+
+            if controller_imid and controller_ip and laptop_imid:
+                try:
+                    # SSH into controller and run add-monitor command
+                    subprocess.run([
+                        'gcloud', 'compute', 'ssh', controller_instance,
+                        '--zone', controller_zone,
+                        '--command',
+                        f'sudo intermesh sky add-monitor {laptop_imid}'
+                    ],
+                                   check=True,
+                                   capture_output=True)
+                    logger.info(f'Registered laptop as monitor for service: {service_name}')
+                    logger.info(f'To monitor cluster, run: intermesh sky monitor {controller_imid} {controller_ip}')
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f'Failed to register laptop as monitor: {e}')
+            elif not laptop_imid:
+                logger.info('Laptop monitoring not available (no intermesh daemon on laptop)')
+            else:
+                logger.warning('Could not find controller IMID or IP for monitoring setup')
+
+            return  # Controller doesn't need per-node registration
+
+        # Register each node with controller
+        # Nodes have already self-configured via bootstrap script (sky add)
+        # Controller just needs to register them (create name + IP endorsements)
+        for idx, (instance_name, zone, external_ip) in enumerate(instances):
+            # Determine node name from instance name
+            if '-head-' in instance_name:
+                node_name = 'head'
+                use_head_join = True
+            else:
+                # All non-head nodes are workers
+                node_name = f'worker-{idx}'
+                use_head_join = False
+
+            try:
+                # Get node's IMID using helper function
+                node_imid = self._get_instance_imid(instance_name, zone)
+
+                if not node_imid:
+                    logger.warning(
+                        f'Could not get IMID from instance {instance_name}')
+                    continue
+
+                logger.info(
+                    f'Instance {instance_name}: IMID {node_imid[:20]}... IP {external_ip}'
+                )
+
+                # Register node with controller using appropriate command
+                if deployment_type == 'serve':
+                    # SkyServe replica mode - no registration needed
+                    # Replicas are registered by controller, not by laptop
+                    logger.debug(
+                        f'SkyServe replica node - skipping registration (done by controller)'
+                    )
+                else:
+                    # Regular cluster mode - register with add-head or add-node
+                    if use_head_join:
+                        subprocess.run([
+                            intermesh_binary, 'sky', 'add-head', node_imid,
+                            external_ip, cluster_params
+                        ],
+                                       check=True,
+                                       capture_output=True)
+                        logger.info(
+                            f'Registered head node: head.{cluster_params}.sky.mesh')
+                    else:
+                        subprocess.run([
+                            intermesh_binary, 'sky', 'add-node', node_imid,
+                            external_ip, cluster_params, node_name
+                        ],
+                                       check=True,
+                                       capture_output=True)
+                        logger.info(
+                            f'Registered worker node: {node_name}.{cluster_params}.sky.mesh'
+                        )
+
+            except subprocess.CalledProcessError as e:
+                logger.warning(f'Failed to register {instance_name}: {e}')
+                continue
+            except subprocess.TimeoutExpired:
+                logger.warning(f'Timeout registering {instance_name}')
+                continue
+
+        logger.info('Intermesh endorsements configured successfully')
+
     def _update_after_cluster_provisioned(
             self, handle: CloudVmRayResourceHandle,
             prev_handle: Optional[CloudVmRayResourceHandle],
@@ -3467,6 +3755,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 handle.cached_external_ips, auth_config,
                 handle.cached_external_ssh_ports, handle.docker_user,
                 handle.ssh_user)
+
+            # Configure Intermesh endorsements if enabled
+            self._configure_intermesh_endorsements(handle)
 
     def _sync_workdir(self, handle: CloudVmRayResourceHandle,
                       workdir: Union[Path, Dict[str, Any]],

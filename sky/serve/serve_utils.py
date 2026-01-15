@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import shutil
+import subprocess
 import time
 import traceback
 import typing
@@ -56,6 +57,17 @@ else:
     requests = adaptors_common.LazyImport('requests')
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _get_controller_url(controller_port: int) -> str:
+    """Get controller URL.
+
+    Returns localhost URL since laptop communicates with controller via SSH
+    port forwarding. Intermesh is only used for controller ↔ replica
+    communication, not laptop ↔ controller.
+    """
+    return f'http://localhost:{controller_port}'
+
 
 _CONTROLLER_URL = 'http://localhost:{CONTROLLER_PORT}'
 
@@ -580,8 +592,7 @@ def update_service_encoded(service_name: str, version: int, mode: str,
             raise ValueError(f'{capnoun} {service_name!r} does not exist.')
     controller_port = service_status['controller_port']
     resp = requests.post(
-        _CONTROLLER_URL.format(CONTROLLER_PORT=controller_port) +
-        '/controller/update_service',
+        _get_controller_url(controller_port) + '/controller/update_service',
         json={
             'version': version,
             'mode': mode,
@@ -625,8 +636,7 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
 
     controller_port = service_status['controller_port']
     resp = requests.post(
-        _CONTROLLER_URL.format(CONTROLLER_PORT=controller_port) +
-        '/controller/terminate_replica',
+        _get_controller_url(controller_port) + '/controller/terminate_replica',
         json={
             'replica_id': replica_id,
             'purge': purge,
@@ -703,8 +713,7 @@ def _get_service_status(
     try:
         controller_port = record['controller_port']
         resp = requests.get(
-            _CONTROLLER_URL.format(CONTROLLER_PORT=controller_port) +
-            '/autoscaler/info')
+            _get_controller_url(controller_port) + '/autoscaler/info')
         record['target_num_replicas'] = resp.json()['target_num_replicas']
     except requests.exceptions.RequestException:
         record['target_num_replicas'] = None
@@ -1872,6 +1881,19 @@ class ServeCodeGen:
             f'msg = serve_utils.update_service_encoded({service_name!r}, '
             f'{version}, mode={mode!r}, **kwargs)',
             'print(msg, end="", flush=True)',
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def install_intermesh(cls, service_name: str) -> str:
+        """Generate code to install Intermesh on controller and replicas."""
+        code = [
+            'import json',
+            'import requests',
+            f'controller_port = serve_state.get_service_controller_port({service_name!r})',
+            'response = requests.post(f"http://127.0.0.1:{controller_port}/controller/install_intermesh", json={}, timeout=300)',
+            'response.raise_for_status()',
+            'print(json.dumps(response.json()), end="", flush=True)'
         ]
         return cls._build(code)
 

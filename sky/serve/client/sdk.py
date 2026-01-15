@@ -88,6 +88,50 @@ def update(
                        _need_confirmation=_need_confirmation)
 
 
+@context.contextual
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+def update_intermesh(
+    service_name: str,
+    yes: bool = False
+) -> server_common.RequestId[Dict[str, Any]]:
+    """Install Intermesh on an existing service.
+
+    This function retrofits Intermesh onto a service that was deployed without
+    it, enabling E2E encryption between the controller and replicas.
+
+    Args:
+        service_name: Name of the service.
+        yes: Skip confirmation prompt.
+
+    Returns:
+        The request ID of the installation operation.
+
+    Request Returns:
+        Dict with installation results:
+        {
+            'controller': {
+                'status': 'success'|'failed'|'skipped',
+                'imid': '...',
+                'error': '...'
+            },
+            'replicas': {
+                replica_id: {
+                    'status': '...',
+                    'imid': '...',
+                    'error': '...'
+                },
+                ...
+            }
+        }
+
+    Request Raises:
+        RuntimeError: if installation fails completely
+        exceptions.ClusterNotUpError: if controller is not up
+    """
+    return impl.update_intermesh(service_name, pool=False, yes=yes)
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def down(

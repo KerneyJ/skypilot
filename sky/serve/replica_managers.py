@@ -4,6 +4,7 @@ import functools
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
+import subprocess
 import threading
 import time
 import traceback
@@ -18,6 +19,7 @@ from sky import backends
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.backends import backend_utils
 from sky.client import sdk
@@ -102,6 +104,72 @@ def launch_cluster(replica_id: int,
             task.set_resources(type(resources)(overrided_resources))
         task.update_envs({serve_constants.REPLICA_ID_ENV_VAR: str(replica_id)})
 
+        # Inject Intermesh metadata for SkyServe replica
+        # Check task-level intermesh config first, then fall back to global config,
+        # and finally check if controller has Intermesh installed (auto-detection)
+        resources = task.resources
+        base_intermesh_config = {}
+        intermesh_enabled = False
+
+        # Check intermesh config from task resources
+        if resources:
+            for r in resources:
+                task_intermesh = r.cluster_config_overrides.get('intermesh', {})
+                if task_intermesh.get('enabled', False):
+                    intermesh_enabled = True
+                    base_intermesh_config = task_intermesh
+                    break
+
+        # Fall back to global config if not found in task
+        if not intermesh_enabled:
+            intermesh_enabled = skypilot_config.get_nested(('intermesh', 'enabled'), False)
+            if intermesh_enabled:
+                base_intermesh_config = skypilot_config.get_nested(('intermesh',), {})
+
+        # Auto-detection: Check if controller has Intermesh installed
+        # If yes, automatically enable Intermesh for this new replica
+        if not intermesh_enabled:
+            intermesh_binary = skypilot_config.get_nested(
+                ('intermesh', 'binary_path'), '/usr/bin/intermesh')
+            try:
+                # Check if Intermesh daemon is running on controller
+                subprocess.run(
+                    ['sudo', intermesh_binary, 'status'],
+                    check=True,
+                    capture_output=True,
+                    timeout=10
+                )
+                # Controller has Intermesh, enable for this replica
+                logger.info('Controller has Intermesh installed, auto-enabling for new replica')
+                intermesh_enabled = True
+                base_intermesh_config = {'enabled': True}
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                # Controller doesn't have Intermesh, skip
+                logger.debug('Controller does not have Intermesh, skipping auto-configuration')
+                pass
+
+        if intermesh_enabled:
+            # Parse service name from cluster_name (format: "<service>-<replica_id>")
+            service_name = cluster_name.rsplit('-', 1)[0]
+            intermesh_config_with_metadata = dict(base_intermesh_config)
+            intermesh_config_with_metadata['cluster_metadata'] = {
+                'deployment_type': 'serve',
+                'cluster_type': 'replica',
+                'service_name': service_name,
+                'replica_id': replica_id,
+            }
+            # Update resources to include intermesh config with metadata
+            resources = task.resources
+            if resources:
+                for r in resources:
+                    # Access the underlying _cluster_config_overrides directly
+                    if r._cluster_config_overrides is None:
+                        r._cluster_config_overrides = {}
+
+                    # Structure must be: {intermesh: {...}} at top level
+                    r._cluster_config_overrides['intermesh'] = (
+                        intermesh_config_with_metadata)
+
         logger.info(f'Launching replica (id: {replica_id}) cluster '
                     f'{cluster_name} with resources: {task.resources}')
     except Exception as e:  # pylint: disable=broad-except
@@ -136,6 +204,117 @@ def launch_cluster(replica_id: int,
             replica_to_request_id[replica_id] = request_id
             sdk.stream_and_get(request_id)
             logger.info(f'Replica cluster {cluster_name} launched.')
+
+            # Register replica with controller via Intermesh
+            # This code runs ON the controller, so we call intermesh directly
+            # Check task-level intermesh config first, then fall back to global config
+            intermesh_enabled_for_registration = False
+            intermesh_binary = '/usr/bin/intermesh'
+
+            # Check task resources for intermesh config
+            if task.resources:
+                for r in task.resources:
+                    task_intermesh = r.cluster_config_overrides.get('intermesh', {})
+                    if task_intermesh.get('enabled', False):
+                        intermesh_enabled_for_registration = True
+                        intermesh_binary = task_intermesh.get('binary_path', '/usr/bin/intermesh')
+                        break
+
+            # Fall back to global config
+            if not intermesh_enabled_for_registration:
+                intermesh_enabled_for_registration = skypilot_config.get_nested(('intermesh', 'enabled'), False)
+                if intermesh_enabled_for_registration:
+                    intermesh_binary = skypilot_config.get_nested(
+                        ('intermesh', 'binary_path'), '/usr/bin/intermesh')
+
+            if intermesh_enabled_for_registration:
+                # Parse service name from cluster_name
+                service_name = cluster_name.rsplit('-', 1)[0]
+
+                logger.info(f'Registering replica {replica_id} with controller...')
+
+                try:
+                    # Get replica instances via gcloud
+                    result = subprocess.run([
+                        'gcloud', 'compute', 'instances', 'list',
+                        f'--filter=name:{cluster_name}-*',
+                        '--format=value(name,zone,networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP)'
+                    ], check=True, capture_output=True, text=True)
+
+                    replica_instances = []
+                    for line in result.stdout.strip().split('\n'):
+                        if line:
+                            parts = line.split('\t')
+                            if len(parts) == 4:
+                                instance_name, zone, external_ip, internal_ip = parts
+                                replica_instances.append((instance_name, zone, external_ip, internal_ip))
+
+                    if not replica_instances:
+                        logger.warning(f'No instances found for replica: {cluster_name}')
+                        return
+
+                    # Find head node of replica
+                    replica_head = None
+                    for instance_name, zone, external_ip, internal_ip in replica_instances:
+                        if '-head-' in instance_name:
+                            replica_head = (instance_name, zone, external_ip, internal_ip)
+                            break
+
+                    if not replica_head:
+                        logger.warning(f'No head node found for replica: {cluster_name}')
+                        return
+
+                    instance_name, zone, external_ip, internal_ip = replica_head
+
+                    # Get replica IMID via SSH
+                    replica_imid = None
+                    for attempt in range(10):
+                        try:
+                            result = subprocess.run([
+                                'gcloud', 'compute', 'ssh', instance_name,
+                                '--zone', zone,
+                                '--command', 'sudo intermesh sky my-imid'
+                            ], check=True, capture_output=True, text=True, timeout=30)
+                            replica_imid = result.stdout.strip()
+                            if replica_imid:
+                                break
+                        except subprocess.CalledProcessError:
+                            if attempt < 9:
+                                logger.debug(f'IMID not ready on {instance_name}, '
+                                           f'retrying... (attempt {attempt + 1}/10)')
+                                time.sleep(5)
+
+                    if not replica_imid:
+                        logger.warning(f'Failed to get IMID from replica {replica_id}')
+                        return
+
+                    logger.info(f'Replica {replica_id} IMID: {replica_imid[:20]}...')
+
+                    # Run add-replica directly on controller (we're already here!)
+                    # Use internal IP for gossip connections within VPC
+                    result = subprocess.run([
+                        'sudo', intermesh_binary, 'sky', 'add-replica',
+                        replica_imid, str(replica_id), service_name, internal_ip
+                    ], check=True, capture_output=True, text=True)
+
+                    # Capture mesh name from output
+                    mesh_name = result.stdout.strip()
+                    if mesh_name:
+                        # Update ReplicaInfo with mesh name
+                        replica_info = serve_state.get_replica_info_from_id(service_name, replica_id)
+                        if replica_info:
+                            replica_info.mesh_name = mesh_name
+                            serve_state.add_or_update_replica(service_name, replica_id, replica_info)
+                            logger.info(f'Replica {replica_id} mesh name: {mesh_name}')
+
+                    logger.info(f'Successfully registered replica {replica_id} '
+                              'with controller')
+
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f'Failed to register replica {replica_id}: {e}')
+                except subprocess.TimeoutExpired:
+                    logger.warning(f'Timeout registering replica {replica_id}')
+
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
@@ -440,12 +619,13 @@ class ReplicaStatusProperty:
 class ReplicaInfo:
     """Replica info for each replica."""
 
-    _VERSION = 2
+    _VERSION = 3
 
     def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
                  is_spot: bool, location: Optional[spot_placer.Location],
                  version: int, resources_override: Optional[Dict[str,
-                                                                 Any]]) -> None:
+                                                                 Any]],
+                 mesh_name: Optional[str] = None) -> None:
         self._version = self._VERSION
         self.replica_id: int = replica_id
         self.cluster_name: str = cluster_name
@@ -458,6 +638,7 @@ class ReplicaInfo:
         self.location: Optional[Dict[str, Optional[str]]] = (
             location.to_pickleable() if location is not None else None)
         self.resources_override: Optional[Dict[str, Any]] = resources_override
+        self.mesh_name: Optional[str] = mesh_name
 
     def get_spot_location(self) -> Optional[spot_placer.Location]:
         return spot_placer.Location.from_pickleable(self.location)
@@ -491,6 +672,75 @@ class ReplicaInfo:
     def is_ready(self) -> bool:
         return self.status == serve_state.ReplicaStatus.READY
 
+    def _check_intermesh_enabled(self,
+                                  handle: backends.CloudVmRayResourceHandle
+                                 ) -> bool:
+        """Check if Intermesh is enabled for this replica."""
+        # Get cluster YAML config
+        cluster_yaml_dict = global_user_state.get_cluster_yaml_dict(
+            handle.cluster_yaml)
+        if cluster_yaml_dict is None:
+            return False
+
+        # Check provider-level config
+        provider_config = cluster_yaml_dict.get('provider', {}) or {}
+        intermesh_config = provider_config.get('intermesh', {})
+
+        if not intermesh_config:
+            # Fallback to global config
+            global_config = skypilot_config.get_nested(('intermesh',), {})
+            intermesh_config = (global_config
+                                if isinstance(global_config, dict) else {})
+
+        return bool(intermesh_config and intermesh_config.get('enabled', False))
+
+    def _get_mesh_name_from_daemon(
+            self, handle: backends.CloudVmRayResourceHandle,
+            max_retries: int = 3,
+            retry_delay: float = 2.0) -> Optional[str]:
+        """Query mesh name from Intermesh daemon on the replica node.
+
+        Args:
+            handle: The resource handle for the replica cluster
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay in seconds between retries
+
+        Returns the mesh name if successful, None if all retries fail.
+        """
+        for attempt in range(max_retries):
+            try:
+                # SSH into replica and run: sudo intermesh sky my-name
+                runner = backend_utils.SSHCommandRunner(handle.cluster_name)
+                returncode, stdout, stderr = runner.run(
+                    ['sudo', 'intermesh', 'sky', 'my-name'],
+                    stream_logs=False,
+                    require_outputs=True)
+
+                if returncode == 0 and stdout:
+                    mesh_name = stdout.strip()
+                    if mesh_name:
+                        logger.debug(f'Successfully retrieved mesh name from '
+                                     f'daemon: {mesh_name}')
+                        return mesh_name
+
+                logger.debug(
+                    f'Attempt {attempt + 1}/{max_retries}: Failed to get '
+                    f'mesh name (returncode={returncode})')
+
+            except Exception as e:
+                logger.debug(
+                    f'Attempt {attempt + 1}/{max_retries}: Exception while '
+                    f'querying mesh name: {e}')
+
+            # Wait before retrying (except on last attempt)
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+
+        logger.warning(
+            f'Failed to query mesh name from daemon after {max_retries} '
+            f'attempts for replica {self.replica_id}')
+        return None
+
     @property
     def url(self) -> Optional[str]:
         handle = self.handle()
@@ -503,6 +753,16 @@ class ReplicaInfo:
             # would error out when trying to get the endpoint.
             return None
         replica_port_int = int(self.replica_port)
+
+        # Intermesh proxy integration: If mesh name is set, use it
+        # The Intermesh daemon handles DNS resolution and mTLS tunneling.
+        if self.mesh_name:
+            mesh_url = f'http://{self.mesh_name}:{replica_port_int}'
+            logger.debug(f'Using Intermesh mesh URL for replica '
+                         f'{self.replica_id}: {mesh_url}')
+            return mesh_url
+
+        # Fallback to IP-based endpoint (existing behavior)
         try:
             endpoint_dict = backend_utils.get_endpoints(handle.cluster_name,
                                                         replica_port_int)
@@ -725,6 +985,29 @@ class ReplicaManager:
 
     def get_active_replica_urls(self) -> List[str]:
         """Get the urls of the active replicas."""
+        raise NotImplementedError
+
+    def install_intermesh(self) -> Dict[str, Any]:
+        """Install Intermesh on controller and all replicas.
+
+        Returns:
+            Dict with installation results:
+            {
+                'controller': {
+                    'status': 'success'|'failed'|'skipped',
+                    'imid': '...',
+                    'error': '...'
+                },
+                'replicas': {
+                    replica_id: {
+                        'status': '...',
+                        'imid': '...',
+                        'error': '...'
+                    },
+                    ...
+                }
+            }
+        """
         raise NotImplementedError
 
 
@@ -1547,3 +1830,381 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _get_readiness_timeout_seconds(self, version: int) -> int:
         return self._get_version_spec(version).readiness_timeout_seconds
+
+    def install_intermesh(self) -> Dict[str, Any]:
+        """Install Intermesh on controller and all replicas."""
+        import subprocess
+        from sky import skypilot_config
+
+        result = {
+            'controller': {},
+            'replicas': {}
+        }
+
+        # Get intermesh config
+        intermesh_config = skypilot_config.get_nested(('intermesh',), {})
+        if not isinstance(intermesh_config, dict):
+            intermesh_config = {}
+
+        intermesh_binary = intermesh_config.get('binary_path', '/usr/bin/intermesh')
+
+        # Step 1: Install on controller
+        logger.info('Installing Intermesh on controller...')
+        try:
+            result['controller'] = self._install_intermesh_on_controller(
+                intermesh_binary)
+        except Exception as e:
+            result['controller'] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+            logger.error(f'Failed to install Intermesh on controller: {e}')
+            # Don't proceed to replicas if controller fails
+            return result
+
+        # Step 2: Install on all active replicas
+        replica_infos = serve_state.get_replica_infos(self._service_name)
+        active_replicas = [
+            r for r in replica_infos
+            if r.status == serve_state.ReplicaStatus.READY
+        ]
+
+        logger.info(f'Installing Intermesh on {len(active_replicas)} active replicas...')
+
+        for replica_info in active_replicas:
+            replica_id = replica_info.replica_id
+            try:
+                replica_result = self._install_intermesh_on_replica(
+                    replica_info,
+                    intermesh_binary,
+                    result['controller']['imid']
+                )
+                result['replicas'][replica_id] = replica_result
+            except Exception as e:
+                result['replicas'][replica_id] = {
+                    'status': 'failed',
+                    'error': str(e)
+                }
+                logger.error(f'Failed to install Intermesh on replica {replica_id}: {e}')
+                continue
+
+        logger.info('Intermesh installation completed')
+
+        # Trigger load balancer to refresh replica URLs immediately
+        self._trigger_url_refresh()
+
+        return result
+
+    def _trigger_url_refresh(self) -> None:
+        """Force load balancer to refresh replica URLs after Intermesh installation.
+
+        The load balancer normally syncs with controller every 20 seconds. This method
+        triggers an immediate sync so that mesh names are used right away.
+        """
+        try:
+            # Get load balancer port from serve state
+            lb_port = serve_state.get_service_load_balancer_port(self._service_name)
+            if lb_port is None:
+                logger.warning(
+                    'Load balancer port not found - URL refresh will happen on next periodic sync')
+                return
+
+            # POST to load balancer's controller sync endpoint
+            # This is the same endpoint load balancer calls periodically (load_balancer.py:97)
+            import requests
+            controller_addr = 'localhost'
+            response = requests.post(
+                f'http://{controller_addr}:{lb_port}/controller/load_balancer_sync',
+                json={},
+                timeout=5
+            )
+            response.raise_for_status()
+            logger.info('Load balancer URL refresh triggered successfully')
+        except Exception as e:
+            logger.warning(
+                f'Failed to trigger immediate URL refresh: {e}. '
+                'Load balancer will use mesh names on next periodic sync (20s).')
+
+    def _install_intermesh_on_controller(
+            self, intermesh_binary: str) -> Dict[str, Any]:
+        """Install Intermesh on the controller cluster.
+
+        Returns:
+            Dict with status and IMID
+        """
+        import subprocess
+
+        # Check if already installed
+        try:
+            subprocess.run(
+                ['sudo', intermesh_binary, 'status'],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+            # Already installed, get IMID
+            controller_imid = subprocess.check_output(
+                ['sudo', intermesh_binary, 'sky', 'my-imid'],
+                text=True,
+                timeout=10
+            ).strip()
+
+            logger.info(f'Controller already has Intermesh (IMID: {controller_imid[:20]}...)')
+            return {
+                'status': 'skipped',
+                'message': 'Already installed',
+                'imid': controller_imid
+            }
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Not installed, proceed with installation
+            pass
+
+        # Check/create firewall rule
+        try:
+            subprocess.run([
+                'gcloud', 'compute', 'firewall-rules', 'describe',
+                'intermesh-gossip-default'
+            ], check=True, capture_output=True, timeout=30)
+            logger.info('Intermesh firewall rule already exists')
+        except subprocess.CalledProcessError:
+            # Create firewall rule
+            logger.info('Creating Intermesh firewall rule...')
+            try:
+                subprocess.run([
+                    'gcloud', 'compute', 'firewall-rules', 'create',
+                    'intermesh-gossip-default',
+                    '--allow', 'tcp:50053',
+                    '--source-ranges', '0.0.0.0/0',
+                    '--description', 'Allow Intermesh gossip protocol on port 50053'
+                ], check=True, capture_output=True, timeout=60)
+                logger.info('Intermesh firewall rule created successfully')
+            except subprocess.CalledProcessError as e:
+                logger.warning(f'Failed to create Intermesh firewall rule: {e}')
+                logger.warning('Continuing installation, but you may need to create the rule manually')
+
+        # Download binary and start daemon
+        logger.info('Downloading and starting Intermesh daemon on controller...')
+
+        bootstrap_script = f'''
+set -e
+
+# Download binary
+if [ ! -f {intermesh_binary} ]; then
+    curl -sL https://raw.githubusercontent.com/KerneyJ/intermesh-binaries/main/intermesh-linux-x86_64 \\
+        -o /tmp/intermesh-download
+    chmod +x /tmp/intermesh-download
+    sudo mv /tmp/intermesh-download {intermesh_binary}
+fi
+
+# Start daemon if not running
+if ! sudo {intermesh_binary} status &>/dev/null; then
+    sudo nohup {intermesh_binary} daemon --intercept --log-file /var/log/intermesh.log &>/dev/null & disown
+
+    # Wait for daemon
+    for i in {{1..30}}; do
+        if sudo {intermesh_binary} status &>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+# Initialize controller with public IP
+PUBLIC_IP=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+sudo {intermesh_binary} sky up --serve {self._service_name} $PUBLIC_IP >/dev/null
+
+# Get IMID
+sudo {intermesh_binary} sky my-imid
+'''
+
+        result = subprocess.run(
+            ['bash', '-c', bootstrap_script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        controller_imid = result.stdout.strip()
+        logger.info(f'Controller initialized with IMID: {controller_imid[:20]}...')
+
+        return {
+            'status': 'success',
+            'imid': controller_imid
+        }
+
+    def _install_intermesh_on_replica(
+        self,
+        replica_info: ReplicaInfo,
+        intermesh_binary: str,
+        controller_imid: str
+    ) -> Dict[str, Any]:
+        """Install Intermesh on a single replica via SSH.
+
+        Args:
+            replica_info: ReplicaInfo object
+            intermesh_binary: Path to intermesh binary
+            controller_imid: Controller's IMID for join command
+
+        Returns:
+            Dict with status and IMID or error
+        """
+        import subprocess
+
+        replica_id = replica_info.replica_id
+        cluster_name = replica_info.cluster_name
+
+        logger.info(f'Installing Intermesh on replica {replica_id} ({cluster_name})...')
+
+        # Discover replica instances (reuse existing pattern from lines 206-238)
+        result = subprocess.run([
+            'gcloud', 'compute', 'instances', 'list',
+            f'--filter=name:{cluster_name}-*',
+            '--format=value(name,zone,networkInterfaces[0].accessConfigs[0].natIP,networkInterfaces[0].networkIP)'
+        ], check=True, capture_output=True, text=True, timeout=30)
+
+        # Find head node
+        replica_head = None
+        for line in result.stdout.strip().split('\n'):
+            if line:
+                parts = line.split('\t')
+                if len(parts) == 4:
+                    instance_name, zone, external_ip, internal_ip = parts
+                    if '-head-' in instance_name:
+                        replica_head = (instance_name, zone, external_ip, internal_ip)
+                        break
+
+        if not replica_head:
+            raise RuntimeError(f'No head node found for replica: {cluster_name}')
+
+        instance_name, zone, external_ip, internal_ip = replica_head
+
+        # Check if already installed
+        try:
+            check_result = subprocess.run([
+                'gcloud', 'compute', 'ssh', instance_name,
+                '--zone', zone,
+                '--command', f'sudo {intermesh_binary} status'
+            ], capture_output=True, timeout=30)
+
+            if check_result.returncode == 0:
+                # Already installed, ensure it's properly joined and registered
+                logger.info(f'Replica {replica_id} already has Intermesh, re-joining and re-registering...')
+
+                # Run sky join on the replica to ensure it's connected
+                join_result = subprocess.run([
+                    'gcloud', 'compute', 'ssh', instance_name,
+                    '--zone', zone,
+                    '--command', f'sudo {intermesh_binary} sky join --serve {controller_imid} {internal_ip} {self._service_name}'
+                ], capture_output=True, text=True, timeout=60)
+
+                if join_result.returncode != 0:
+                    logger.warning(f'Failed to re-join replica {replica_id}: {join_result.stderr}')
+
+                # Get IMID
+                imid_result = subprocess.run([
+                    'gcloud', 'compute', 'ssh', instance_name,
+                    '--zone', zone,
+                    '--command', f'sudo {intermesh_binary} sky my-imid'
+                ], check=True, capture_output=True, text=True, timeout=30)
+
+                replica_imid = imid_result.stdout.strip()
+
+                # Re-register with controller
+                # Use internal IP for gossip connections within VPC
+                add_replica_result = subprocess.run([
+                    'sudo', intermesh_binary, 'sky', 'add-replica',
+                    replica_imid, str(replica_id), self._service_name, internal_ip
+                ], capture_output=True, text=True, timeout=30)
+
+                if add_replica_result.returncode != 0:
+                    logger.warning(f'Failed to re-register replica {replica_id}: {add_replica_result.stderr}')
+                else:
+                    # Capture mesh name from output
+                    mesh_name = add_replica_result.stdout.strip()
+                    if mesh_name:
+                        # Update ReplicaInfo with mesh name
+                        replica_info = serve_state.get_replica_info_from_id(self._service_name, replica_id)
+                        if replica_info:
+                            replica_info.mesh_name = mesh_name
+                            serve_state.add_or_update_replica(self._service_name, replica_id, replica_info)
+                            logger.info(f'Replica {replica_id} mesh name: {mesh_name}')
+
+                logger.info(f'Replica {replica_id} already has Intermesh, re-joined and re-registered')
+
+                return {
+                    'status': 'skipped',
+                    'message': 'Already installed',
+                    'imid': replica_imid
+                }
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            # Not installed, continue
+            pass
+
+        # Install Intermesh on replica
+        logger.info(f'Running installation script on replica {replica_id}...')
+
+        install_script = f'''
+set -e
+
+# Download binary
+if [ ! -f {intermesh_binary} ]; then
+    curl -sL https://raw.githubusercontent.com/KerneyJ/intermesh-binaries/main/intermesh-linux-x86_64 \\
+        -o /tmp/intermesh-download
+    chmod +x /tmp/intermesh-download
+    sudo mv /tmp/intermesh-download {intermesh_binary}
+fi
+
+# Start daemon if not running
+if ! sudo {intermesh_binary} status &>/dev/null; then
+    sudo nohup {intermesh_binary} daemon --intercept --log-file /var/log/intermesh.log &>/dev/null & disown
+
+    # Wait for daemon
+    for i in {{1..30}}; do
+        if sudo {intermesh_binary} status &>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+# Join service
+sudo {intermesh_binary} sky join --serve {controller_imid} {internal_ip} {self._service_name} >/dev/null
+
+# Get IMID
+sudo {intermesh_binary} sky my-imid
+'''
+
+        install_result = subprocess.run([
+            'gcloud', 'compute', 'ssh', instance_name,
+            '--zone', zone,
+            '--command', install_script
+        ], check=True, capture_output=True, text=True, timeout=180)
+
+        replica_imid = install_result.stdout.strip()
+        logger.info(f'Replica {replica_id} installed with IMID: {replica_imid[:20]}...')
+
+        # Register replica with controller
+        # Use internal IP for gossip connections within VPC
+        result = subprocess.run([
+            'sudo', intermesh_binary, 'sky', 'add-replica',
+            replica_imid, str(replica_id), self._service_name, internal_ip
+        ], check=True, capture_output=True, text=True, timeout=30)
+
+        # Capture mesh name from output
+        mesh_name = result.stdout.strip()
+        if mesh_name:
+            # Update ReplicaInfo with mesh name
+            replica_info = serve_state.get_replica_info_from_id(self._service_name, replica_id)
+            if replica_info:
+                replica_info.mesh_name = mesh_name
+                serve_state.add_or_update_replica(self._service_name, replica_id, replica_info)
+                logger.info(f'Replica {replica_id} mesh name: {mesh_name}')
+
+        logger.info(f'Successfully registered replica {replica_id} with controller')
+
+        return {
+            'status': 'success',
+            'imid': replica_imid,
+            'mesh_name': mesh_name
+        }

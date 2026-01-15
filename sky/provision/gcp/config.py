@@ -173,6 +173,167 @@ def construct_clients_from_provider_config(provider_config):
     )
 
 
+def _configure_intermesh(cluster_name: str, config: common.ProvisionConfig) -> common.ProvisionConfig:
+    """Configure Intermesh bootstrap script if enabled.
+
+    Injects Intermesh daemon installation and trust policy configuration
+    into the VM's startup metadata.
+
+    Args:
+        cluster_name: The name of the cluster.
+        config: The provision configuration to modify.
+
+    Returns:
+        The modified provision configuration.
+    """
+    import subprocess
+    from sky import skypilot_config
+
+    # Check if Intermesh is enabled in provider config or global config
+    logger.debug(f'Intermesh: provider_config keys: {list(config.provider_config.keys())}')
+    intermesh_config = config.provider_config.get('intermesh', {})
+
+    # Fall back to global config if not in provider config
+    if not intermesh_config:
+        global_config = skypilot_config.get_nested(('intermesh',), {})
+        intermesh_config = global_config if isinstance(global_config, dict) else {}
+
+    logger.debug(f'Intermesh: config found: {intermesh_config}')
+    if not intermesh_config or not intermesh_config.get('enabled', False):
+        logger.debug('Intermesh: not enabled, skipping')
+        return config
+
+    logger.info('Intermesh: configuration enabled, bootstrapping nodes')
+
+    # Get intermesh binary path (default to standard system location)
+    intermesh_binary = intermesh_config.get('binary_path', '/usr/bin/intermesh')
+
+    # Check deployment type and cluster type from metadata
+    cluster_metadata = intermesh_config.get('cluster_metadata', {})
+    deployment_type = cluster_metadata.get('deployment_type', 'cluster')
+    cluster_type = cluster_metadata.get('cluster_type', 'regular')
+
+    # Get controller/root IMID via sky my-imid command
+    # Only required for non-controller clusters (replicas need to join the controller)
+    # Controllers self-initialize via setup script
+    root_imid = None
+    if cluster_type != 'controller':
+        try:
+            root_imid = subprocess.check_output(
+                ['sudo', intermesh_binary, 'sky', 'my-imid'],
+                text=True,
+                stderr=subprocess.PIPE
+            ).strip()
+        except FileNotFoundError:
+            logger.error(f'Intermesh binary not found at: {intermesh_binary}')
+            logger.error('Please install Intermesh or set intermesh.binary_path in config')
+            logger.error('Skipping Intermesh configuration')
+            return config
+        except subprocess.CalledProcessError as e:
+            logger.error(f'Failed to get controller IMID: {e}')
+            logger.error('Is the Intermesh daemon running? Try: sudo intermesh daemon &')
+            logger.error('Skipping Intermesh configuration')
+            return config
+
+    # Create GCP firewall rule for Intermesh gossip (port 50053)
+    # Extract VPC name from network interfaces to create rule on correct network
+    vpc_name = None
+    if 'networkInterfaces' in config.node_config:
+        network_url = config.node_config['networkInterfaces'][0].get('network')
+        if network_url:
+            vpc_name = network_url.split('/')[-1]
+    elif 'networkConfig' in config.node_config:
+        network_url = config.node_config['networkConfig'].get('network')
+        if network_url:
+            vpc_name = network_url.split('/')[-1]
+
+    # TODO(kerneyj): It seems to work without it so I'm thinking of removing this later
+    if not vpc_name:
+        logger.warning('Intermesh: could not determine VPC name, skipping firewall rule creation')
+    else:
+        try:
+            # Use VPC-specific rule name to avoid conflicts
+            rule_name = f'intermesh-gossip-{vpc_name}'
+
+            # Check if firewall rule already exists
+            check_result = subprocess.run(
+                ['gcloud', 'compute', 'firewall-rules', 'describe', rule_name],
+                capture_output=True,
+                text=True
+            )
+            if check_result.returncode == 0:
+                logger.info(f'Intermesh: firewall rule {rule_name} already exists')
+            else:
+                # Create firewall rule on the correct VPC network
+                logger.info(f'Intermesh: creating firewall rule {rule_name} on network {vpc_name}')
+                subprocess.run(
+                    ['gcloud', 'compute', 'firewall-rules', 'create', rule_name,
+                     '--network', vpc_name,
+                     '--allow', 'tcp:50053',
+                     '--source-ranges', '0.0.0.0/0',
+                     '--description', 'Allow Intermesh gossip protocol on port 50053'],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                logger.info(f'Intermesh: firewall rule {rule_name} created successfully')
+        except subprocess.CalledProcessError as e:
+            logger.warning(f'Failed to create Intermesh firewall rule: {e}')
+            logger.warning(f'You may need to manually create the rule: '
+                          f'gcloud compute firewall-rules create {rule_name} '
+                          f'--network {vpc_name} --allow tcp:50053 --source-ranges 0.0.0.0/0')
+
+    # Get cluster name for use in intermesh naming
+    cluster_params = f"{cluster_name}.cluster"
+
+    # Format the join command based on deployment type and cluster type
+    # Controllers self-initialize via setup script, so no join command needed
+    if cluster_type == 'controller':
+        logger.info(f'Intermesh: SkyServe controller for service: {cluster_metadata.get("service_name")}')
+        logger.info('Intermesh: Controller will self-initialize via setup script')
+        join_command = 'echo "Controller will initialize via setup script"'
+    elif deployment_type == 'serve':
+        # SkyServe replica mode - use --serve flag
+        service_name = cluster_metadata.get('service_name', 'unknown')
+        logger.info(f'Intermesh: SkyServe replica mode for service: {service_name}')
+        join_command = f'sudo intermesh sky join --serve {root_imid} "$INTERNAL_IP" {service_name}'
+    else:
+        # Regular cluster mode - no --serve flag
+        logger.info(f'Intermesh: Regular cluster mode for: {cluster_name}')
+        join_command = f'sudo intermesh sky join {root_imid} "$INTERNAL_IP" {cluster_params}'
+
+    # Format the bootstrap script with join command
+    bootstrap_script = constants.INTERMESH_BOOTSTRAP_SCRIPT.format(
+        join_command=join_command
+    )
+
+    # Inject into node_config metadata
+    # GCP expects metadata in items array format: {items: [{key: ..., value: ...}]}
+    if 'metadata' not in config.node_config:
+        config.node_config['metadata'] = {'items': []}
+
+    # Check if startup-script already exists
+    metadata_items = config.node_config['metadata'].get('items', [])
+    startup_script_exists = False
+    for item in metadata_items:
+        if item.get('key') == 'startup-script':
+            # Append to existing startup script
+            item['value'] = item['value'] + '\n\n' + bootstrap_script
+            startup_script_exists = True
+            break
+
+    if not startup_script_exists:
+        # Add new startup-script entry
+        metadata_items.append({
+            'key': 'startup-script',
+            'value': bootstrap_script,
+        })
+
+    config.node_config['metadata']['items'] = metadata_items
+    logger.info('Intermesh bootstrap script injected into node metadata')
+    return config
+
+
 def bootstrap_instances(
         region: str, cluster_name: str,
         config: common.ProvisionConfig) -> common.ProvisionConfig:
@@ -196,6 +357,9 @@ def bootstrap_instances(
     config.node_config.update(iam_role)
     config = _configure_subnet(region, cluster_name, config, compute)
     config = _configure_placement_policy(region, cluster_name, config, compute)
+
+    # Intermesh: Inject bootstrap script if enabled
+    config = _configure_intermesh(cluster_name, config)
 
     return config
 

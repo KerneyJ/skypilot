@@ -129,6 +129,35 @@ BASH_SCRIPT_START = textwrap.dedent("""#!/bin/bash
 set -e
 set -x
 """)
+
+# Bootstrap script for Intermesh clusters (supports both regular and serve mode)
+INTERMESH_BOOTSTRAP_SCRIPT = textwrap.dedent("""
+# Download precompiled Intermesh binary directly from GitHub
+curl -sL https://raw.githubusercontent.com/KerneyJ/intermesh-binaries/main/intermesh-linux-x86_64 \\
+  -o /usr/bin/intermesh
+chmod +x /usr/bin/intermesh
+
+# Get metadata from GCP
+INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \\
+  http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+
+# Start daemon with traffic interception enabled
+sudo intermesh daemon --intercept --log-file /var/log/intermesh.log &
+
+# Wait for daemon to be ready (up to 30 seconds)
+for i in {{1..30}}; do
+  if sudo intermesh status &>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+
+# Self-configure using appropriate join command based on deployment type
+{join_command}
+
+echo "Intermesh bootstrap completed"
+""")
+
 DISK_MOUNT_USER_DATA_TEMPLATE = textwrap.dedent("""
     # Define arrays for devices and mount points
     declare -A device_mounts=(

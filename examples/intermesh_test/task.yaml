@@ -1,0 +1,60 @@
+# Simple test task to validate Intermesh integration with sky launch
+#
+# This example demonstrates using Intermesh for encrypted mesh networking
+# in a basic SkyPilot cluster.
+#
+# Prerequisites:
+# 1. Install Intermesh on your laptop:
+#    curl -sL https://raw.githubusercontent.com/KerneyJ/intermesh-binaries/main/intermesh-linux-x86_64 -o /usr/bin/intermesh
+#    chmod +x /usr/bin/intermesh
+# 2. Start the Intermesh daemon:
+#    sudo intermesh daemon &
+#
+# Usage:
+#   sky launch -c intermesh-test examples/intermesh_test/task.yaml
+#
+# To verify Intermesh is working:
+#   1. Check logs during provisioning for "Configuring Intermesh endorsements"
+#   2. SSH into head node: sky ssh intermesh-test
+#   3. Check Intermesh status: intermesh status
+#   4. Verify gossip peers are visible
+#   5. Check on laptop: intermesh status (should show cluster nodes)
+
+name: intermesh-test
+
+resources:
+  cloud: gcp
+  cpus: 2+
+
+num_nodes: 2
+
+setup: |
+  echo "Cluster is up!"
+  echo "Node rank: $SKYPILOT_NODE_RANK"
+
+  # Wait a moment for Intermesh daemon to be ready
+  sleep 5
+
+  # Check if Intermesh is installed and running
+  if command -v intermesh &> /dev/null; then
+    echo "✓ Intermesh binary found"
+    intermesh status || echo "⚠ Intermesh daemon may not be running"
+  else
+    echo "✗ Intermesh binary not found"
+  fi
+
+run: |
+  echo "Running on node $SKYPILOT_NODE_RANK"
+  echo ""
+  echo "=== Intermesh Status ==="
+  intermesh status 2>&1 || echo "Intermesh not available on this node"
+  echo ""
+  echo "=== Node Information ==="
+  echo "Hostname: $(hostname)"
+  echo "Internal IP: $(hostname -I | awk '{print $1}')"
+  echo "External IP: $(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)"
+
+config:
+  intermesh:
+    enabled: true
+    binary_path: /usr/bin/intermesh

@@ -169,6 +169,10 @@ class SkyServeLoadBalancer:
             encountered if anything goes wrong.
         """
         logger.info(f'Proxy request to {url}')
+        # Log when using Intermesh mesh names for debugging
+        if '.mesh' in url or '.sky:' in url:
+            logger.debug(f'Using Intermesh mesh name for replica connection: '
+                         f'{url}')
         self._load_balancing_policy.pre_execute_hook(url, request)
         try:
             # We defer the get of the client here on purpose, for case when the
@@ -180,8 +184,12 @@ class SkyServeLoadBalancer:
                 client = self._client_pool.get(url, None)
             if client is None:
                 return RuntimeError(f'Client for {url} not found.')
-            worker_url = httpx.URL(path=request.url.path,
-                                   query=request.url.query.encode('utf-8'))
+            # Only include query if non-empty to avoid adding trailing '?'
+            if request.url.query:
+                worker_url = httpx.URL(path=request.url.path,
+                                       query=request.url.query.encode('utf-8'))
+            else:
+                worker_url = httpx.URL(path=request.url.path)
             proxy_request = client.build_request(
                 request.method,
                 worker_url,

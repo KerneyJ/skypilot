@@ -626,6 +626,14 @@ class GCP(clouds.Cloud):
                 keys=('force_enable_external_ips',),
                 default_value=False)
 
+        # Intermesh configuration
+        intermesh_config = skypilot_config.get_nested(
+            keys=('intermesh',),
+            default_value=None,
+            override_configs=resources.cluster_config_overrides)
+        if intermesh_config:
+            resources_vars['intermesh'] = intermesh_config
+
         volumes, device_mount_points = GCP._get_volumes_specs(
             region, zones, r.instance_type, r.volumes, use_mig,
             resources_vars['tpu_vm'])

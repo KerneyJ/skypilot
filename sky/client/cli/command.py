@@ -6194,6 +6194,39 @@ def serve_update(
     # the way we did for pools.
     cloud, region, zone = _handle_infra_cloud_region_zone_options(
         infra, cloud, region, zone)
+
+    # Check if this is an intermesh-only update (before generating task)
+    # This allows YAML files with only "intermesh: enabled: true" to work
+    # without requiring a service section.
+    is_yaml, _ = _check_yaml(''.join(service_yaml))
+    if is_yaml:
+        yaml_path = ''.join(service_yaml)
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                yaml_content = f.read()
+
+            # Import the detection function
+            from sky.serve.client.impl import _is_intermesh_only_update
+
+            if _is_intermesh_only_update(yaml_content):
+                click.secho(
+                    'Detected intermesh-only update. Installing Intermesh '
+                    'without replica replacement...', fg='cyan')
+                try:
+                    request_id = serve_lib.update_intermesh(service_name, yes=yes)
+                    _async_call_or_wait(request_id, async_call,
+                                       'sky.serve.update_intermesh')
+                    return
+                except Exception as update_error:
+                    # Intermesh-only update failed - don't fall through to normal update
+                    import traceback
+                    click.secho(f'Failed to install Intermesh: {update_error}', fg='red')
+                    logger.error(traceback.format_exc())
+                    raise
+        except Exception as e:
+            # If detection fails, fall back to normal update flow
+            logger.debug(f'Intermesh-only detection failed: {e}')
+
     task = _generate_task_with_service(
         service_name=service_name,
         service_yaml_args=service_yaml,

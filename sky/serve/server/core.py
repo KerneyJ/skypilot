@@ -66,6 +66,21 @@ def update(task: Optional['sky.Task'],
 
 
 @usage_lib.entrypoint
+def update_intermesh(service_name: str) -> Dict[str, Any]:
+    """Install Intermesh on an existing service.
+
+    Please refer to the sky.cli.serve_update for the document.
+
+    Args:
+        service_name: Name of the service.
+
+    Returns:
+        Dict with installation results per component.
+    """
+    return impl.update_intermesh(service_name, pool=False)
+
+
+@usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def down(
     service_names: Optional[Union[str, List[str]]] = None,
