@@ -1020,6 +1020,16 @@ def get_task_schema():
             '_metadata': {
                 'type': 'object',
             },
+            'intermesh': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'enabled': {
+                        'type': 'boolean',
+                    },
+                },
+            },
         }
     }
 
@@ -1471,6 +1481,19 @@ def get_config_schema():
                 },
                 'placement_policy': {
                     'type': 'string',
+                },
+                'intermesh': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'enabled': {
+                            'type': 'boolean',
+                        },
+                        'binary_path': {
+                            'type': 'string',
+                        },
+                    },
                 },
                 'vpc_name': {
                     'oneOf': [
@@ -2146,6 +2169,19 @@ def get_config_schema():
             'logs': logs_schema,
             'daemons': daemon_schema,
             'data': data_schema,
+            'intermesh': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'enabled': {
+                        'type': 'boolean',
+                    },
+                    'binary_path': {
+                        'type': 'string',
+                    },
+                },
+            },
             **cloud_configs,
         },
     }

@@ -66,6 +66,16 @@ def update(task: Optional['sky.Task'],
 
 
 @usage_lib.entrypoint
+def update_intermesh(service_name: str) -> None:
+    """Installs Intermesh on an existing service without restarting replicas.
+
+    Args:
+        service_name: Name of the service.
+    """
+    return impl.update_intermesh(service_name)
+
+
+@usage_lib.entrypoint
 # pylint: disable=redefined-builtin
 def down(
     service_names: Optional[Union[str, List[str]]] = None,
