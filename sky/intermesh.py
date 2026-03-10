@@ -1,9 +1,10 @@
 """Intermesh integration for SkyPilot cross-cloud networking."""
+import asyncio
 import re
 import shlex
 import subprocess
 import textwrap
-from typing import TYPE_CHECKING
+from typing import Any, List, Tuple, TYPE_CHECKING
 
 try:
     import tomllib
@@ -17,8 +18,12 @@ from sky.backends import backend_utils
 from sky.serve import serve_state
 from sky.utils import command_runner
 from sky.utils.command_runner import CommandRunner
+from sky.utils.command_runner import LocalProcessCommandRunner
 
 if TYPE_CHECKING:
+    from typing import Union
+
+    from sky import dag as dag_lib
     from sky import Task
     from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
 
@@ -167,17 +172,25 @@ def install_intermesh(runner: CommandRunner, external_ip: str) -> None:
             f'Error installing Intermesh: {e}') from e
 
 
-def is_intermesh_enabled(task: 'Task') -> bool:
-    """Determine if Intermesh is enabled in a task.
+def is_intermesh_enabled(task_or_dag: 'Union[Task, dag_lib.Dag]') -> bool:
+    """Determine if Intermesh is enabled for a task or DAG.
+
+    For Tasks (SkyServe): checks resources.cluster_config_overrides
+    For Dags (Job Groups): checks dag.intermesh_config from header
 
     Args:
-        task: Task config dictionary
+        task_or_dag: A Task or Dag object
 
     Returns:
-        True if there exists an intermesh resource in task and that
-        resource has a field enabled that has value True
+        True if intermesh is enabled
     """
-    for resource in task.resources:
+    # Check if this is a Dag (has intermesh_config attribute)
+    if hasattr(task_or_dag, 'intermesh_config'):
+        intermesh_config = task_or_dag.intermesh_config or {}
+        return intermesh_config.get('enabled', False)
+
+    # Task case: check resources.cluster_config_overrides
+    for resource in task_or_dag.resources:
         intermesh_config = resource.cluster_config_overrides.get(
             'intermesh', {})
         if intermesh_config:
@@ -224,7 +237,7 @@ def get_imid(runner: CommandRunner) -> str:
         raise exceptions.IntermeshError(f'Could not retrieve imid: {e}') from e
 
 
-def _get_local_ip(runner: CommandRunner) -> str:
+def _get_endorsed_ip(runner: CommandRunner) -> str:
     """Get the local IP from Intermesh daemon state.
 
     Args:
@@ -399,6 +412,38 @@ def replica_join_mesh(runner: CommandRunner, controller_imid: str,
         raise exceptions.IntermeshError(f'Error joining mesh: {e}') from e
 
 
+def _open_intermesh_ports(handle: 'CloudVmRayResourceHandle') -> None:
+    """Open Intermesh ports on a cluster's security group.
+
+    Args:
+        handle: CloudVmRayResourceHandle for the cluster
+
+    Raises:
+        exceptions.IntermeshError: If port opening fails
+    """
+    cloud = handle.launched_resources.cloud
+    cluster_info = handle.cached_cluster_info
+    provider_config = cluster_info.provider_config if cluster_info else None
+
+    if provider_config is None:
+        raise exceptions.IntermeshError(
+            f'No provider_config available for opening ports on '
+            f'{handle.cluster_name}')
+
+    # Ensure firewall_rule is set for GCP (required by open_ports)
+    # This may be missing if the cluster was provisioned without ports
+    if 'firewall_rule' not in provider_config or \
+            provider_config.get('firewall_rule') is None:
+        provider_config = dict(provider_config)
+        provider_config['firewall_rule'] = (
+            f'sky-ports-{handle.cluster_name_on_cloud}')
+
+    logger.debug(f'[Intermesh] Opening ports {INTERMESH_REQUIRED_PORTS} on '
+                 f'{handle.cluster_name}')
+    provision_lib.open_ports(repr(cloud), handle.cluster_name_on_cloud,
+                             INTERMESH_REQUIRED_PORTS, provider_config)
+
+
 def configure_intermesh_replica(handle: 'CloudVmRayResourceHandle',
                                 replica_id: int, service_name: str) -> bool:
     """Configures Intermesh on a replica.
@@ -441,24 +486,12 @@ def configure_intermesh_replica(handle: 'CloudVmRayResourceHandle',
 
     try:
         install_intermesh(head_runner, replica_external_ip)
-
-        # Open Intermesh ports on the replica's firewall/security group
-        cloud = handle.launched_resources.cloud
-        cluster_info = handle.cached_cluster_info
-        provider_config = (cluster_info.provider_config
-                           if cluster_info else None)
-        if provider_config is None:
-            raise exceptions.IntermeshError(
-                'No provider_config available for opening ports')
-        logger.debug(f'[Intermesh] Opening ports '
-                     f'{INTERMESH_REQUIRED_PORTS} on replica')
-        provision_lib.open_ports(repr(cloud), handle.cluster_name_on_cloud,
-                                 INTERMESH_REQUIRED_PORTS, provider_config)
+        _open_intermesh_ports(handle)
 
         # Get controller info - runs locally on the serve controller node
         local_runner = command_runner.LocalProcessCommandRunner()
         controller_imid = get_imid(local_runner)
-        controller_ip = _get_local_ip(local_runner)
+        controller_ip = _get_endorsed_ip(local_runner)
 
         # Replica joins the mesh using controller's identity
         replica_imid = replica_join_mesh(head_runner, controller_imid,
@@ -514,16 +547,409 @@ def configure_intermesh_controller(handle: 'CloudVmRayResourceHandle') -> None:
     install_intermesh(head_runner, head_ip)
     logger.debug('[Intermesh] Successfully installed on controller')
 
-    # Open Intermesh ports on the controller's firewall/security group
-    cloud = handle.launched_resources.cloud
-    cluster_info = handle.cached_cluster_info
-    provider_config = cluster_info.provider_config if cluster_info else None
-    if provider_config is None:
-        raise exceptions.IntermeshError(
-            'No provider_config available for opening ports on controller')
-    logger.debug(f'[Intermesh] Opening ports '
-                 f'{INTERMESH_REQUIRED_PORTS} on controller')
-    provision_lib.open_ports(repr(cloud), handle.cluster_name_on_cloud,
-                             INTERMESH_REQUIRED_PORTS, provider_config)
-
+    _open_intermesh_ports(handle)
     initialize_mesh(head_runner)
+
+
+# ============================================================
+# Job Groups Support
+# ============================================================
+
+
+def _make_job_group_mesh_domain(job_group_name: str) -> str:
+    """Generate mesh domain for job group.
+
+    Args:
+        job_group_name: Name of the job group
+
+    Returns:
+        Mesh domain (e.g., "my-job-group.sky.mesh")
+    """
+    return f'{job_group_name}.{SKYPILOT_MESH_DOMAIN}'
+
+
+def _make_task_mesh_name(task_name: str, node_idx: int,
+                         job_group_name: str) -> str:
+    """Generate mesh name for a task node in a job group.
+
+    Args:
+        task_name: Name of the task
+        node_idx: Node index within the task (0 for head, 1+ for workers)
+        job_group_name: Name of the job group
+
+    Returns:
+        Full mesh name (e.g., "trainer-0.my-job-group.sky.mesh")
+    """
+    return f'{task_name}-{node_idx}.{job_group_name}.{SKYPILOT_MESH_DOMAIN}'
+
+
+def _setup_job_group_coordinator(
+    runner: CommandRunner,
+    job_group_name: str,
+    coordinator_name: str,
+) -> str:
+    """Initialize mesh on coordinator node.
+
+    Args:
+        runner: CommandRunner for the coordinator node
+        job_group_name: Name of the job group
+        coordinator_name: Mesh name for the coordinator
+
+    Returns:
+        IMID of the coordinator
+
+    Raises:
+        exceptions.IntermeshError: If initialization fails
+    """
+    mesh_domain = _make_job_group_mesh_domain(job_group_name)
+    logger.debug(f'[Intermesh] Initializing mesh {mesh_domain} on coordinator')
+
+    config_cmd = [
+        'sudo', 'intermesh', 'adhoc', 'init', '--name', coordinator_name,
+        '--mesh', mesh_domain, '--quiet'
+    ]
+
+    try:
+        returncode, _, stderr = runner.run(
+            cmd=config_cmd,
+            stream_logs=False,
+            require_outputs=True,
+        )
+
+        if returncode != 0:
+            raise exceptions.IntermeshError(
+                f'Failed to initialize mesh: {stderr}')
+
+        imid = get_imid(runner)
+        logger.debug(f'[Intermesh] Coordinator initialized, IMID: {imid[:20]}')
+        return imid
+
+    except (OSError, subprocess.SubprocessError) as e:
+        raise exceptions.IntermeshError(f'Error initializing mesh: {e}') from e
+
+
+def _job_group_node_join(
+    runner: CommandRunner,
+    job_group_name: str,
+    coordinator_imid: str,
+    coordinator_ip: str,
+) -> str:
+    """Join mesh on non-coordinator node.
+
+    Args:
+        runner: CommandRunner for the joining node
+        job_group_name: Name of the job group
+        coordinator_imid: IMID of the coordinator
+        coordinator_ip: External IP of the coordinator
+
+    Returns:
+        IMID of the joining node
+
+    Raises:
+        exceptions.IntermeshError: If joining fails
+    """
+    mesh_domain = _make_job_group_mesh_domain(job_group_name)
+    logger.debug(f'[Intermesh] Node joining mesh {mesh_domain}')
+
+    join_cmd = [
+        'sudo', 'intermesh', 'adhoc', 'join', '--mesh', mesh_domain,
+        '--root-imid', coordinator_imid, '--root-ip', coordinator_ip, '--yes'
+    ]
+
+    try:
+        returncode, _, stderr = runner.run(
+            cmd=join_cmd,
+            stream_logs=False,
+            require_outputs=True,
+        )
+
+        if returncode != 0:
+            raise exceptions.IntermeshError(f'Failed to join mesh: {stderr}')
+
+        imid = get_imid(runner)
+        logger.debug(f'[Intermesh] Node joined mesh, IMID: {imid[:20]}...')
+        return imid
+
+    except (OSError, subprocess.SubprocessError) as e:
+        raise exceptions.IntermeshError(f'Error joining mesh: {e}') from e
+
+
+def _register_job_group_node(
+    coordinator_runner: CommandRunner,
+    mesh_name: str,
+    node_imid: str,
+    node_ip: str,
+) -> None:
+    """Register a node with the coordinator.
+
+    Args:
+        coordinator_runner: CommandRunner for the coordinator node
+        mesh_name: Full mesh name for the node
+        node_imid: IMID of the node to register
+        node_ip: External IP of the node
+
+    Raises:
+        exceptions.IntermeshError: If registration fails
+    """
+    logger.debug(f'[Intermesh] Registering node {mesh_name}')
+
+    add_cmd = [
+        'sudo', 'intermesh', 'adhoc', 'add', '--name', mesh_name, '--imid',
+        node_imid, '--ip', node_ip
+    ]
+
+    try:
+        returncode, _, stderr = coordinator_runner.run(
+            cmd=add_cmd,
+            stream_logs=False,
+            require_outputs=True,
+        )
+
+        if returncode != 0:
+            raise exceptions.IntermeshError(
+                f'Failed to register node {mesh_name}: {stderr}')
+
+        logger.debug(f'[Intermesh] Registered {mesh_name}')
+
+    except (OSError, subprocess.SubprocessError) as e:
+        raise exceptions.IntermeshError(
+            f'Error registering node {mesh_name}: {e}') from e
+
+
+async def _install_on_node_async(
+    runner: CommandRunner,
+    external_ip: str,
+) -> None:
+    """Install intermesh on a node asynchronously.
+
+    Raises:
+        exceptions.IntermeshError: If installation fails
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None,
+                               lambda: install_intermesh(runner, external_ip))
+
+
+async def _open_ports_async(handle: 'CloudVmRayResourceHandle') -> None:
+    """Open intermesh ports on a cluster asynchronously.
+
+    Raises:
+        exceptions.IntermeshError: If port opening fails
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: _open_intermesh_ports(handle))
+
+
+async def _node_join_async(
+    runner: CommandRunner,
+    job_group_name: str,
+    coordinator_imid: str,
+    coordinator_ip: str,
+) -> str:
+    """Have a node join the mesh asynchronously.
+
+    Returns:
+        IMID of the joined node
+
+    Raises:
+        exceptions.IntermeshError: If joining fails
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _job_group_node_join(runner, job_group_name,
+                                           coordinator_imid, coordinator_ip))
+
+
+async def _create_marker_async(
+    runner: CommandRunner,
+    marker_path: str,
+) -> None:
+    """Create networking ready marker file asynchronously."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, lambda: runner.run(
+            f'touch {marker_path}', stream_logs=False, require_outputs=True))
+
+
+async def setup_job_group_intermesh(
+    job_group_name: str,
+    tasks_handles: List[Tuple['Task', 'CloudVmRayResourceHandle']],
+    marker_path: str,
+) -> None:
+    """Set up Intermesh networking for a Job Group.
+
+    This orchestrates the full intermesh setup:
+    1. Install intermesh on all nodes (parallel)
+    2. Open ports on all clusters (parallel)
+    3. Initialize mesh on coordinator (first task's head node)
+    4. All other nodes join (parallel)
+    5. Register all nodes with coordinator (sequential)
+    6. Wait for gossip propagation
+    7. Create marker files on all nodes
+
+    Args:
+        job_group_name: Name of the job group
+        tasks_handles: List of (Task, ResourceHandle) tuples
+        marker_path: Path to the networking ready marker file
+
+    Raises:
+        exceptions.IntermeshError: If setup fails
+
+    TODO(kerneyj): Replace marker files and gossip wait with mesh verification.
+    The controller statically knows all mesh names that should exist (it spawns
+    and names each job cluster). Instead of synchronizing on marker files and
+    arbitrary timeouts, the controller should distribute the list of expected
+    mesh names to each node. Each node then waits until all expected names
+    appear in its `intermesh debug dump --toml` output before proceeding.
+    This approach:
+    1. Verifies the mesh is actually working (nodes can resolve each other)
+    2. Removes reliance on arbitrary gossip propagation timeouts
+    3. Eliminates the need for marker files
+    """
+    if not tasks_handles:
+        raise exceptions.IntermeshError('No tasks to set up')
+
+    logger.info(f'[Intermesh] Setting up mesh for job group: {job_group_name}')
+
+    # Collect all nodes: (runner, task_name, node_idx, external_ip, handle)
+    # Node info: (runner, task_name, node_idx, external_ip, handle)
+    all_nodes: List[Tuple[Any, str, int, str, 'CloudVmRayResourceHandle']] = []
+    for task, handle in tasks_handles:
+        if handle is None:
+            logger.warning(f'[Intermesh] Skipping task {task.name}: no handle')
+            continue
+
+        task_name = task.name
+        if task_name is None:
+            logger.warning('[Intermesh] Skipping task with no name')
+            continue
+
+        external_ips = handle.cached_external_ips
+        if not external_ips:
+            logger.warning(f'[Intermesh] Skipping task {task_name}: '
+                           'no external IPs')
+            continue
+
+        try:
+            runners = handle.get_command_runners()
+        except (RuntimeError, ValueError, OSError) as e:
+            raise exceptions.IntermeshError(
+                f'Failed to get runners for {task_name}: {e}') from e
+
+        for node_idx, (runner,
+                       external_ip) in enumerate(zip(runners, external_ips)):
+            all_nodes.append((runner, task_name, node_idx, external_ip, handle))
+
+    if not all_nodes:
+        raise exceptions.IntermeshError('No valid nodes found')
+
+    logger.info(f'[Intermesh] Found {len(all_nodes)} nodes across '
+                f'{len(tasks_handles)} tasks')
+
+    # Step 1: Install intermesh on all nodes in parallel
+    logger.info('[Intermesh] Installing on all nodes...')
+    install_tasks = [
+        _install_on_node_async(runner, external_ip)
+        for runner, task_name, node_idx, external_ip, _ in all_nodes
+    ]
+    install_results = await asyncio.gather(*install_tasks,
+                                           return_exceptions=True)
+    install_errors = [r for r in install_results if isinstance(r, Exception)]
+    if install_errors:
+        raise exceptions.IntermeshError(
+            f'Installation failed on {len(install_errors)} nodes: '
+            f'{install_errors[0]}')
+
+    # Step 2: Open ports on all clusters in parallel (deduplicated)
+    logger.info('[Intermesh] Opening ports on all clusters...')
+    seen_clusters: set[str] = set()
+    port_tasks = []
+    for task, handle in tasks_handles:
+        if handle is None or handle.cluster_name in seen_clusters:
+            continue
+        seen_clusters.add(handle.cluster_name)
+        port_tasks.append(_open_ports_async(handle))
+
+    if port_tasks:
+        port_results = await asyncio.gather(*port_tasks, return_exceptions=True)
+        port_errors = [r for r in port_results if isinstance(r, Exception)]
+        if port_errors:
+            raise exceptions.IntermeshError(
+                f'Port opening failed on {len(port_errors)} clusters: '
+                f'{port_errors[0]}')
+
+    # Step 3: Get controller's mesh info (already set up by client side)
+    # The controller is the coordinator, set up via
+    # configure_intermesh_controller() from the client before job launch.
+    # We just need to get its IMID and IP.
+    coord_runner = LocalProcessCommandRunner()
+    logger.info('[Intermesh] Getting controller mesh info...')
+
+    loop = asyncio.get_running_loop()
+    try:
+        coord_imid = await loop.run_in_executor(None,
+                                                lambda: get_imid(coord_runner))
+        coord_ip = await loop.run_in_executor(
+            None, lambda: _get_endorsed_ip(coord_runner))
+    except exceptions.IntermeshError as e:
+        raise exceptions.IntermeshError(
+            f'Controller intermesh not running. Was '
+            f'configure_intermesh_controller called from client? '
+            f'Error: {e}') from e
+
+    logger.info(f'[Intermesh] Controller IMID: {coord_imid[:20]}..., '
+                f'IP: {coord_ip}')
+
+    # Step 4: All job nodes join the controller (all nodes are joiners)
+    joined_nodes: List[Tuple[str, str, str]] = []  # (mesh_name, imid, ip)
+
+    logger.info(
+        f'[Intermesh] {len(all_nodes)} nodes joining controller mesh...')
+    join_tasks = [
+        _node_join_async(runner, job_group_name, coord_imid, coord_ip)
+        for runner, _, _, _, _ in all_nodes
+    ]
+    join_results = await asyncio.gather(*join_tasks, return_exceptions=True)
+
+    for i, result in enumerate(join_results):
+        _, task_name, node_idx, external_ip, _ = all_nodes[i]
+        if isinstance(result, Exception):
+            raise exceptions.IntermeshError(
+                f'Node {task_name}-{node_idx} failed to join: {result}')
+        # result is the IMID string since we checked isinstance above
+        assert isinstance(result, str)
+        imid = result
+        mesh_name = _make_task_mesh_name(task_name, node_idx, job_group_name)
+        joined_nodes.append((mesh_name, imid, external_ip))
+
+    # Step 5: Register all nodes with coordinator (sequential)
+    logger.info('[Intermesh] Registering nodes with coordinator...')
+    for mesh_name, imid, external_ip in joined_nodes:
+        await loop.run_in_executor(None, _register_job_group_node, coord_runner,
+                                   mesh_name, imid, external_ip)
+
+    # Step 6: Wait for gossip propagation
+    # Intermesh uses a gossip protocol to propagate mesh membership info.
+    # 5 seconds allows ~2-3 gossip rounds which is sufficient for small meshes.
+    # TODO(kerneyj): Replace marker files and gossip wait with mesh
+    # verification. The controller statically knows all mesh names that should
+    # exist (it spawns and names each job cluster). Instead of synchronizing
+    # on marker files and arbitrary timeouts, the controller should distribute
+    # the list of expected mesh names to each node. Each node then waits until
+    # all expected names appear in its `intermesh debug dump --toml` output
+    # before proceeding. This approach:
+    # 1. Verifies the mesh is actually working (nodes can resolve each other)
+    # 2. Removes reliance on arbitrary gossip propagation timeouts
+    # 3. Eliminates the need for marker files
+    logger.info('[Intermesh] Waiting for gossip propagation...')
+    await asyncio.sleep(5)
+
+    # Step 7: Create marker files on all nodes
+    logger.info('[Intermesh] Creating marker files...')
+    marker_tasks = [
+        _create_marker_async(runner, marker_path)
+        for runner, _, _, _, _ in all_nodes
+    ]
+    await asyncio.gather(*marker_tasks, return_exceptions=True)
+
+    logger.info(f'[Intermesh] Job group {job_group_name} mesh setup complete')

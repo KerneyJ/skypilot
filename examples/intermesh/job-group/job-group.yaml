@@ -1,0 +1,80 @@
+# Job Groups Multi-Cloud Test (GCP + AWS)
+#
+# This example demonstrates job groups running across multiple clouds.
+# Tasks are distributed between GCP and AWS, communicating via the
+# job group network using intermesh.
+#
+# Architecture:
+#   - gcp-server: HTTP server running on GCP (port 8001)
+#   - aws-server: HTTP server running on AWS (port 8002)
+#   - coordinator: Runs on GCP, connects to both servers
+#
+# Primary/Auxiliary Behavior:
+#   The coordinator is the primary task. When tests complete, all auxiliary
+#   services are terminated after a 5-second grace period.
+#
+# Usage:
+#   sky jobs launch examples/intermesh/job-group/job-group.yaml
+---
+name: multicloud-jobgroup-test
+execution: parallel
+primary_tasks: [coordinator]
+termination_delay: 5s
+intermesh:
+  enabled: true
+
+---
+# GCP Server: HTTP server on Google Cloud
+name: gcp-server
+resources:
+  cloud: gcp
+  region: us-central1
+  instance_type: e2-medium
+
+workdir: examples/intermesh/job-group
+
+setup: |
+  pip install fastapi uvicorn
+
+run: |
+  echo "Starting GCP server..."
+  echo "JobGroup: ${SKYPILOT_JOBGROUP_NAME}"
+  echo "Server endpoint: http://gcp-server-0.${SKYPILOT_JOBGROUP_NAME}:8001"
+  python scripts/gcp_server.py
+
+---
+# AWS Server: HTTP server on Amazon Web Services
+name: aws-server
+resources:
+  cloud: aws
+  region: us-east-1
+  instance_type: t3.small
+
+workdir: examples/intermesh/job-group
+
+setup: |
+  pip install fastapi uvicorn
+
+run: |
+  echo "Starting AWS server..."
+  echo "JobGroup: ${SKYPILOT_JOBGROUP_NAME}"
+  echo "Server endpoint: http://aws-server-0.${SKYPILOT_JOBGROUP_NAME}:8002"
+  python scripts/aws_server.py
+
+---
+# Coordinator: Tests cross-cloud connectivity
+name: coordinator
+resources:
+  cloud: gcp
+  region: us-west1
+  instance_type: e2-medium
+
+workdir: examples/intermesh/job-group
+
+setup: |
+  pip install httpx
+
+run: |
+  echo "Starting multi-cloud coordinator..."
+  echo "JobGroup: ${SKYPILOT_JOBGROUP_NAME}"
+  python scripts/coordinator.py
