@@ -9,25 +9,25 @@ import uvicorn
 app = FastAPI()
 
 
-@app.get("/health")
+@app.get('/health')
 def health():
-    return {"status": "healthy", "service": "gcp-server", "cloud": "gcp"}
+    return {'status': 'healthy', 'service': 'gcp-server', 'cloud': 'gcp'}
 
 
-@app.get("/info")
+@app.get('/info')
 def info():
     return {
-        "message": "Hello from GCP!",
-        "cloud": "gcp",
-        "region": "us-central1",
-        "port": 8001
+        'message': 'Hello from GCP!',
+        'cloud': 'gcp',
+        'region': 'us-central1',
+        'port': 8001
     }
 
 
-@app.post("/echo")
+@app.post('/echo')
 def echo(data: dict):
-    return {"received": data, "from": "gcp-server"}
+    return {'received': data, 'from': 'gcp-server'}
 
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+if __name__ == '__main__':
+    uvicorn.run(app, host='0.0.0.0', port=8001)
