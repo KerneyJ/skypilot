@@ -1,0 +1,15 @@
+name: intermesh-update-test
+
+resources:
+  cloud: gcp
+  cpus: 2
+  ports: 8080
+
+service:
+  replicas: 1
+  readiness_probe:
+    path: /
+    initial_delay_seconds: 10
+
+run: |
+  python -m http.server 8080

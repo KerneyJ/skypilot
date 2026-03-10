@@ -27,7 +27,9 @@ import typing
 from typing import List, Tuple
 
 from sky import clouds as sky_clouds
+from sky import intermesh
 from sky import sky_logging
+from sky.provision.kubernetes import utils as k8s_utils
 from sky.utils import command_runner
 
 if typing.TYPE_CHECKING:
@@ -66,8 +68,6 @@ def _get_k8s_namespace_from_handle(
     if handle.launched_resources and handle.launched_resources.region:
         # In K8s, region is the context name
         try:
-            # pylint: disable=import-outside-toplevel
-            from sky.provision.kubernetes import utils as k8s_utils
             return k8s_utils.get_kube_config_context_namespace(
                 handle.launched_resources.region)
         except Exception as e:  # pylint: disable=broad-except
@@ -408,8 +408,8 @@ class NetworkConfigurator:
     """Configures network infrastructure for JobGroups.
 
     Handles platform-specific network configuration:
-    - K8s: No configuration needed (DNS works automatically)
-    - SSH clouds: Injects /etc/hosts entries for hostname resolution
+    - K8s: Uses DNS updater for hostname resolution
+    - SSH clouds: Uses /etc/hosts injection, or Intermesh if enabled
     """
 
     @staticmethod
@@ -417,18 +417,48 @@ class NetworkConfigurator:
         job_group_name: str,
         tasks_handles: List[Tuple[
             'task_lib.Task', 'cloud_vm_ray_backend.CloudVmRayResourceHandle']],
+        use_intermesh: bool = False,
     ) -> bool:
         """Set up network configuration for JobGroup.
 
         Args:
             job_group_name: Name of the JobGroup.
             tasks_handles: List of (Task, ResourceHandle) tuples.
+            use_intermesh: If True, use Intermesh for SSH clouds instead
+                of /etc/hosts injection.
 
         Returns:
             True if all configuration succeeded, False otherwise.
         """
-        return await NetworkConfigurator._inject_etc_hosts(
-            job_group_name, tasks_handles)
+        # Separate SSH and K8s handles
+        ssh_handles = [(t, h)
+                       for t, h in tasks_handles
+                       if h is not None and not _is_kubernetes(h)]
+        k8s_handles = [(t, h)
+                       for t, h in tasks_handles
+                       if h is not None and _is_kubernetes(h)]
+
+        success = True
+
+        # SSH clouds: use intermesh if enabled, otherwise /etc/hosts
+        if ssh_handles:
+            if use_intermesh:
+                # No fallback - if intermesh is enabled and fails, the job
+                # should fail. Cross-cloud networking won't work without it.
+                await intermesh.setup_job_group_intermesh(
+                    job_group_name, ssh_handles)
+                logger.info('[Intermesh] Setup succeeded for SSH clouds')
+            else:
+                success = await NetworkConfigurator._inject_etc_hosts(
+                    job_group_name, ssh_handles)
+
+        # K8s: always use DNS updater
+        if k8s_handles:
+            k8s_success = await NetworkConfigurator._inject_etc_hosts(
+                job_group_name, k8s_handles)
+            success = success and k8s_success
+
+        return success
 
     @staticmethod
     async def _inject_etc_hosts(
@@ -532,6 +562,7 @@ async def setup_job_group_networking(
     job_group_name: str,
     tasks_handles: List[Tuple['task_lib.Task',
                               'cloud_vm_ray_backend.CloudVmRayResourceHandle']],
+    use_intermesh: bool = False,
 ) -> bool:
     """Set up networking for all tasks in a JobGroup.
 
@@ -540,12 +571,15 @@ async def setup_job_group_networking(
     Args:
         job_group_name: Name of the JobGroup.
         tasks_handles: List of (Task, ResourceHandle) tuples for each task.
+        use_intermesh: If True, use Intermesh for cross-cloud networking
+            on SSH clouds instead of /etc/hosts injection.
 
     Returns:
         True if setup succeeded, False otherwise.
     """
     logger.info(f'Setting up networking for JobGroup: {job_group_name}')
-    return await NetworkConfigurator.setup(job_group_name, tasks_handles)
+    return await NetworkConfigurator.setup(job_group_name, tasks_handles,
+                                           use_intermesh)
 
 
 def get_network_ready_marker_path(job_group_name: str) -> str:
@@ -565,24 +599,35 @@ def get_network_ready_marker_path(job_group_name: str) -> str:
 
 
 def generate_wait_for_networking_script(job_group_name: str,
-                                        other_job_names: List[str]) -> str:
+                                        other_job_names: List[str],
+                                        use_intermesh: bool = False) -> str:
     """Generate a bash script to wait for network setup.
 
     This script should be prepended to task.setup to ensure networking
     is ready before the task starts.
 
-    The script has two phases:
+    For intermesh: No waiting needed - the controller verifies mesh resolution
+    before jobs start, so networking is guaranteed ready.
+
+    For non-intermesh: Two phases:
     1. Wait for the networking ready marker file (created by Phase 3)
-    2. Wait for all hostnames to be resolvable
+    2. Wait for all hostnames to be resolvable via /etc/hosts
 
     Args:
         job_group_name: Name of the JobGroup.
         other_job_names: List of other task names in the group to wait for.
+        use_intermesh: If True, networking is verified by controller - no wait.
 
     Returns:
         Bash script as a string.
     """
-    # Generate hostnames to wait for
+    # For intermesh, networking is verified by the controller before jobs start.
+    # The controller polls each node's mesh resolution state, so by the time
+    # this script runs, all mesh names are guaranteed resolvable.
+    if use_intermesh:
+        return ''
+
+    # Non-intermesh case: wait for /etc/hosts to be populated
     hostnames = [
         f'{task_name}-0.{job_group_name}' for task_name in other_job_names
     ]

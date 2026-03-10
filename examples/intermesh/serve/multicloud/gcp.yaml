@@ -1,0 +1,21 @@
+# GCP-only service for multi-cloud testing
+#
+# Usage:
+#   sky serve up -n gcp-service examples/serve/intermesh/multicloud/gcp.yaml
+
+name: gcp-service
+
+resources:
+  cloud: gcp
+  region: us-central1
+  cpus: 2
+  ports: 8080
+
+service:
+  replicas: 2
+  readiness_probe:
+    path: /
+    initial_delay_seconds: 10
+
+run: |
+  python -m http.server 8080

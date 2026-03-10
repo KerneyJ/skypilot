@@ -88,6 +88,32 @@ def update(
                        _need_confirmation=_need_confirmation)
 
 
+@context.contextual
+@usage_lib.entrypoint
+@server_common.check_server_healthy_or_start
+def update_intermesh(
+    service_name: str,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False
+) -> server_common.RequestId[None]:
+    """Installs Intermesh on an existing service without restarting replicas.
+
+    Args:
+        service_name: Name of the service.
+        _need_confirmation: (Internal only) Whether to show a confirmation
+            prompt before installing Intermesh.
+
+    Returns:
+        The request ID of the update_intermesh request.
+
+    Request Returns:
+        None
+    """
+    return impl.update_intermesh(service_name,
+                                 _need_confirmation=_need_confirmation)
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 def down(

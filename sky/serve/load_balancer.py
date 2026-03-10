@@ -169,6 +169,10 @@ class SkyServeLoadBalancer:
             encountered if anything goes wrong.
         """
         logger.info(f'Proxy request to {url}')
+        # Log when using Intermesh mesh names for debugging
+        if '.mesh' in url:
+            logger.debug(f'Using Intermesh mesh name for replica connection: '
+                         f'{url}')
         self._load_balancing_policy.pre_execute_hook(url, request)
         try:
             # We defer the get of the client here on purpose, for case when the

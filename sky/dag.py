@@ -58,6 +58,11 @@ class Dag:
         # a dict like {"default": "30s", "replay-buffer": "1m"}.
         self.termination_delay: Optional[Union[str, Dict[str, str]]] = None
 
+        # Intermesh configuration for cross-cloud networking in job groups.
+        # If set, enables intermesh-based service discovery for SSH clouds.
+        # Example: {'enabled': True}
+        self.intermesh_config: Optional[Dict[str, typing.Any]] = None
+
     def add(self, task: 'task.Task') -> None:
         self.graph.add_node(task)
         self.tasks.append(task)
