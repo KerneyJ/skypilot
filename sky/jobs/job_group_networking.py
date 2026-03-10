@@ -439,7 +439,6 @@ class NetworkConfigurator:
                        if h is not None and _is_kubernetes(h)]
 
         success = True
-        marker_path = get_network_ready_marker_path(job_group_name)
 
         # SSH clouds: use intermesh if enabled, otherwise /etc/hosts
         if ssh_handles:
@@ -447,7 +446,7 @@ class NetworkConfigurator:
                 # No fallback - if intermesh is enabled and fails, the job
                 # should fail. Cross-cloud networking won't work without it.
                 await intermesh.setup_job_group_intermesh(
-                    job_group_name, ssh_handles, marker_path)
+                    job_group_name, ssh_handles)
                 logger.info('[Intermesh] Setup succeeded for SSH clouds')
             else:
                 success = await NetworkConfigurator._inject_etc_hosts(
@@ -607,30 +606,31 @@ def generate_wait_for_networking_script(job_group_name: str,
     This script should be prepended to task.setup to ensure networking
     is ready before the task starts.
 
-    The script has two phases:
+    For intermesh: No waiting needed - the controller verifies mesh resolution
+    before jobs start, so networking is guaranteed ready.
+
+    For non-intermesh: Two phases:
     1. Wait for the networking ready marker file (created by Phase 3)
-    2. Wait for all hostnames to be resolvable
+    2. Wait for all hostnames to be resolvable via /etc/hosts
 
     Args:
         job_group_name: Name of the JobGroup.
         other_job_names: List of other task names in the group to wait for.
-        use_intermesh: If True, use Intermesh hostname format with .sky.mesh
-            suffix.
+        use_intermesh: If True, networking is verified by controller - no wait.
 
     Returns:
         Bash script as a string.
     """
-    # Generate hostnames to wait for
+    # For intermesh, networking is verified by the controller before jobs start.
+    # The controller polls each node's mesh resolution state, so by the time
+    # this script runs, all mesh names are guaranteed resolvable.
     if use_intermesh:
-        # Intermesh uses DNS interception with .sky.mesh suffix
-        hostnames = [
-            f'{task_name}-0.{job_group_name}.sky.mesh'
-            for task_name in other_job_names
-        ]
-    else:
-        hostnames = [
-            f'{task_name}-0.{job_group_name}' for task_name in other_job_names
-        ]
+        return ''
+
+    # Non-intermesh case: wait for /etc/hosts to be populated
+    hostnames = [
+        f'{task_name}-0.{job_group_name}' for task_name in other_job_names
+    ]
 
     if not hostnames:
         return ''

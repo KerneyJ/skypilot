@@ -282,6 +282,36 @@ def _get_endorsed_ip(runner: CommandRunner) -> str:
             f'Could not retrieve local ip: {e}') from e
 
 
+def _get_resolved_names(runner: CommandRunner) -> set:
+    """Get set of resolved mesh names from intermesh derivation state.
+
+    Args:
+        runner: CommandRunner for the node
+
+    Returns:
+        Set of mesh name strings that are currently resolvable on this node.
+        Returns empty set if intermesh is not ready or command fails.
+    """
+    try:
+        returncode, stdout, stderr = runner.run(
+            cmd=['sudo', 'intermesh', 'debug', 'dump', '--toml'],
+            stream_logs=False,
+            require_outputs=True,
+        )
+        if returncode != 0:
+            logger.debug(f'[Intermesh] debug dump failed: {stderr}')
+            return set()
+
+        data = tomllib.loads(stdout)
+        name_to_imid = data.get('derivation', {}).get('name_to_imid', {})
+        return set(name_to_imid.keys())
+
+    except (OSError, subprocess.SubprocessError, tomllib.TOMLDecodeError,
+            KeyError, TypeError) as e:
+        logger.debug(f'[Intermesh] Failed to get resolved names: {e}')
+        return set()
+
+
 def register_replica(replica_imid: str, replica_id: int, service_name: str,
                      replica_ip: str) -> str:
     """Register a replica with the controller for Intermesh.
@@ -760,52 +790,69 @@ async def _node_join_async(
                                            coordinator_imid, coordinator_ip))
 
 
-async def _create_marker_async(
+async def _wait_for_mesh_resolution_async(
     runner: CommandRunner,
-    marker_path: str,
+    expected_names: set,
+    timeout: float = 60.0,
+    poll_interval: float = 2.0,
 ) -> None:
-    """Create networking ready marker file asynchronously."""
+    """Wait for all expected mesh names to be resolvable on a node.
+
+    Polls the node's intermesh derivation state until all expected names
+    appear in the name_to_imid map, indicating the mesh has propagated.
+
+    Args:
+        runner: CommandRunner for the node
+        expected_names: Set of mesh name strings that must be resolvable
+        timeout: Maximum time to wait in seconds (default 60s)
+        poll_interval: Time between polls in seconds (default 2s)
+
+    Raises:
+        exceptions.IntermeshError: If timeout is reached before all names
+            resolve
+    """
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, lambda: runner.run(
-            f'touch {marker_path}', stream_logs=False, require_outputs=True))
+    start_time = loop.time()
+
+    while True:
+        resolved = await loop.run_in_executor(
+            None, lambda: _get_resolved_names(runner))
+
+        if expected_names.issubset(resolved):
+            return  # All names resolved
+
+        elapsed = loop.time() - start_time
+        if elapsed >= timeout:
+            missing = expected_names - resolved
+            raise exceptions.IntermeshError(
+                f'Mesh resolution timeout after {timeout}s. '
+                f'Missing names: {missing}')
+
+        await asyncio.sleep(poll_interval)
 
 
 async def setup_job_group_intermesh(
     job_group_name: str,
     tasks_handles: List[Tuple['Task', 'CloudVmRayResourceHandle']],
-    marker_path: str,
 ) -> None:
     """Set up Intermesh networking for a Job Group.
 
     This orchestrates the full intermesh setup:
     1. Install intermesh on all nodes (parallel)
     2. Open ports on all clusters (parallel)
-    3. Initialize mesh on coordinator (first task's head node)
-    4. All other nodes join (parallel)
+    3. Get controller mesh info (already set up by client)
+    4. All job nodes join the controller mesh (parallel)
     5. Register all nodes with coordinator (sequential)
-    6. Wait for gossip propagation
-    7. Create marker files on all nodes
+    6. Wait for mesh name resolution on all nodes (parallel polling)
 
     Args:
         job_group_name: Name of the job group
         tasks_handles: List of (Task, ResourceHandle) tuples
-        marker_path: Path to the networking ready marker file
 
     Raises:
         exceptions.IntermeshError: If setup fails
-
-    TODO(kerneyj): Replace marker files and gossip wait with mesh verification.
-    The controller statically knows all mesh names that should exist (it spawns
-    and names each job cluster). Instead of synchronizing on marker files and
-    arbitrary timeouts, the controller should distribute the list of expected
-    mesh names to each node. Each node then waits until all expected names
-    appear in its `intermesh debug dump --toml` output before proceeding.
-    This approach:
-    1. Verifies the mesh is actually working (nodes can resolve each other)
-    2. Removes reliance on arbitrary gossip propagation timeouts
-    3. Eliminates the need for marker files
     """
+
     if not tasks_handles:
         raise exceptions.IntermeshError('No tasks to set up')
 
@@ -928,28 +975,27 @@ async def setup_job_group_intermesh(
         await loop.run_in_executor(None, _register_job_group_node, coord_runner,
                                    mesh_name, imid, external_ip)
 
-    # Step 6: Wait for gossip propagation
-    # Intermesh uses a gossip protocol to propagate mesh membership info.
-    # 5 seconds allows ~2-3 gossip rounds which is sufficient for small meshes.
-    # TODO(kerneyj): Replace marker files and gossip wait with mesh
-    # verification. The controller statically knows all mesh names that should
-    # exist (it spawns and names each job cluster). Instead of synchronizing
-    # on marker files and arbitrary timeouts, the controller should distribute
-    # the list of expected mesh names to each node. Each node then waits until
-    # all expected names appear in its `intermesh debug dump --toml` output
-    # before proceeding. This approach:
-    # 1. Verifies the mesh is actually working (nodes can resolve each other)
-    # 2. Removes reliance on arbitrary gossip propagation timeouts
-    # 3. Eliminates the need for marker files
-    logger.info('[Intermesh] Waiting for gossip propagation...')
-    await asyncio.sleep(5)
+    # Step 6: Wait for mesh resolution on all nodes
+    # Poll each node's intermesh derivation state until all expected mesh names
+    # are resolvable. This verifies the mesh is actually working rather than
+    # relying on an arbitrary gossip timeout.
+    logger.info('[Intermesh] Waiting for mesh name resolution...')
+    expected_names = {mesh_name for mesh_name, _, _ in joined_nodes}
+    expected_names.add(_make_controller_name())  # controller.sky.mesh
 
-    # Step 7: Create marker files on all nodes
-    logger.info('[Intermesh] Creating marker files...')
-    marker_tasks = [
-        _create_marker_async(runner, marker_path)
+    resolution_tasks = [
+        _wait_for_mesh_resolution_async(runner, expected_names)
         for runner, _, _, _, _ in all_nodes
     ]
-    await asyncio.gather(*marker_tasks, return_exceptions=True)
+    resolution_results = await asyncio.gather(*resolution_tasks,
+                                              return_exceptions=True)
+    resolution_errors = [
+        r for r in resolution_results if isinstance(r, Exception)
+    ]
+    if resolution_errors:
+        error_msgs = [str(e) for e in resolution_errors]
+        raise exceptions.IntermeshError(
+            f'Mesh resolution failed on {len(resolution_errors)} node(s): '
+            f'{"; ".join(error_msgs)}')
 
     logger.info(f'[Intermesh] Job group {job_group_name} mesh setup complete')
