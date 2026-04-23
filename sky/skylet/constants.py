@@ -511,6 +511,7 @@ OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('slurm', 'sbatch_options'),
     ('slurm', 'cpu_partition'),
     ('active_workspace',),
+    ('intermesh',),
 ]
 # When overriding the SkyPilot configs on the API server with the client one,
 # we skip the following keys because they are meant to be client-side configs.

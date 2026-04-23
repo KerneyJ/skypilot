@@ -701,6 +701,11 @@ class GitError(Exception):
     pass
 
 
+class IntermeshError(Exception):
+    """Raised when an Intermesh operation fails."""
+    pass
+
+
 class RequestInterruptedError(Exception):
     """Raised when a request is interrupted by the server.
     Client is expected to retry the request immediately when

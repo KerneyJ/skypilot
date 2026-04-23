@@ -17,6 +17,7 @@ import requests
 from sky import backends
 from sky import exceptions
 from sky import global_user_state
+from sky import intermesh
 from sky import sky_logging
 from sky import task as task_lib
 from sky.backends import backend_utils
@@ -136,6 +137,30 @@ def launch_cluster(replica_id: int,
             replica_to_request_id[replica_id] = request_id
             sdk.stream_and_get(request_id)
             logger.info(f'Replica cluster {cluster_name} launched.')
+
+            # Install and configure Intermesh on replica if enabled
+            if intermesh.is_intermesh_enabled(task):
+                logger.debug(f'[Intermesh] Installing on replica '
+                             f'{replica_id} ({cluster_name})')
+                replica_handle = global_user_state.get_handle_from_cluster_name(
+                    cluster_name)
+                service_name = cluster_name.rsplit('-', 1)[0]
+
+                if replica_handle is None:
+                    logger.error(f'[Intermesh] Could not get handle for '
+                                 f'replica {replica_id}')
+                elif not isinstance(replica_handle,
+                                    backends.CloudVmRayResourceHandle):
+                    logger.error(f'[Intermesh] Replica {replica_id} handle '
+                                 f'is not CloudVmRayResourceHandle')
+                else:
+                    if intermesh.configure_intermesh_replica(
+                            replica_handle, replica_id, service_name):
+                        logger.debug(f'Successfully configured intermesh '
+                                     f'on replica {replica_id}')
+                    else:
+                        logger.debug(
+                            'Failed to configure intermesh, proceeding without')
         except (exceptions.InvalidClusterNameError,
                 exceptions.NoCloudAccessError,
                 exceptions.ResourcesMismatchError) as e:
@@ -440,12 +465,17 @@ class ReplicaStatusProperty:
 class ReplicaInfo:
     """Replica info for each replica."""
 
-    _VERSION = 2
+    _VERSION = 3
 
-    def __init__(self, replica_id: int, cluster_name: str, replica_port: str,
-                 is_spot: bool, location: Optional[spot_placer.Location],
-                 version: int, resources_override: Optional[Dict[str,
-                                                                 Any]]) -> None:
+    def __init__(self,
+                 replica_id: int,
+                 cluster_name: str,
+                 replica_port: str,
+                 is_spot: bool,
+                 location: Optional[spot_placer.Location],
+                 version: int,
+                 resources_override: Optional[Dict[str, Any]],
+                 mesh_name: Optional[str] = None) -> None:
         self._version = self._VERSION
         self.replica_id: int = replica_id
         self.cluster_name: str = cluster_name
@@ -458,6 +488,7 @@ class ReplicaInfo:
         self.location: Optional[Dict[str, Optional[str]]] = (
             location.to_pickleable() if location is not None else None)
         self.resources_override: Optional[Dict[str, Any]] = resources_override
+        self.mesh_name: Optional[str] = mesh_name
 
     def get_spot_location(self) -> Optional[spot_placer.Location]:
         return spot_placer.Location.from_pickleable(self.location)
@@ -503,6 +534,16 @@ class ReplicaInfo:
             # would error out when trying to get the endpoint.
             return None
         replica_port_int = int(self.replica_port)
+
+        # Intermesh proxy integration: If mesh name is set, use it
+        # The Intermesh daemon handles DNS resolution and mTLS tunneling.
+        if self.mesh_name:
+            mesh_url = f'http://{self.mesh_name}:{replica_port_int}'
+            logger.debug(f'Using Intermesh mesh URL for replica '
+                         f'{self.replica_id}: {mesh_url}')
+            return mesh_url
+
+        # Fallback to IP-based endpoint (existing behavior)
         try:
             endpoint_dict = backend_utils.get_endpoints(handle.cluster_name,
                                                         replica_port_int)
@@ -670,6 +711,9 @@ class ReplicaInfo:
 
         if version < 2:
             self.resources_override = None
+
+        if version < 3:
+            self.mesh_name = None
 
         self.__dict__.update(state)
 

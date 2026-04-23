@@ -6910,6 +6910,20 @@ def serve_update(
         sky serve update --mode blue_green sky-service-16aa new_service.yaml
 
     """
+    # Check if this is an intermesh-only update
+    yaml_path = ''.join(service_yaml)
+    try:
+        config = yaml_utils.read_yaml(yaml_path)
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        raise click.UsageError(f'Failed to read {yaml_path}: {e}') from None
+    if config == {'intermesh': {'enabled': True}}:
+        logger.debug(f'Installing Intermesh on service {service_name!r}...')
+        request_id = serve_lib.update_intermesh(service_name,
+                                                _need_confirmation=not yes)
+        _async_call_or_wait(request_id, async_call,
+                            'sky.serve.update_intermesh')
+        return
+
     # TODO(lloyd-brown): Add a way to update number of replicas for serve
     # the way we did for pools.
     cloud, region, zone = _handle_infra_cloud_region_zone_options(

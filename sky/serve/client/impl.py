@@ -113,6 +113,30 @@ def update(
         return server_common.get_request_id(response)
 
 
+def update_intermesh(
+    service_name: str,
+    # Internal only:
+    # pylint: disable=invalid-name
+    _need_confirmation: bool = False
+) -> server_common.RequestId[None]:
+    if _need_confirmation:
+        click.confirm(
+            f'Installing Intermesh on service {service_name!r}. '
+            'Proceed?',
+            default=True,
+            abort=True,
+            show_default=True)
+
+    body = payloads.ServeUpdateIntermeshBody(service_name=service_name)
+
+    response = server_common.make_authenticated_request(
+        'POST',
+        '/serve/update_intermesh',
+        json=json.loads(body.model_dump_json()),
+        timeout=(5, None))
+    return server_common.get_request_id(response)
+
+
 def apply(
     task: Optional[Union['sky.Task', 'sky.Dag']],
     workers: Optional[int],

@@ -21,6 +21,7 @@ import sky
 from sky import core
 from sky import exceptions
 from sky import global_user_state
+from sky import intermesh
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
@@ -1024,8 +1025,9 @@ class JobController:
         # - setup runs during cluster provisioning (Phase 1)
         # - DNS mappings file is written in Phase 3 (after clusters are UP)
         # - If we block in setup, it times out before Phase 3 can run
+        use_intermesh = intermesh.is_intermesh_enabled(self._dag)
         wait_script = job_group_networking.generate_wait_for_networking_script(
-            job_group_name, other_job_names)
+            job_group_name, other_job_names, use_intermesh=use_intermesh)
         if wait_script:
             # Prepend wait script to task run
             current_run = task.run or ''
@@ -1086,6 +1088,8 @@ class JobController:
             True if task succeeded, False otherwise.
         """
 
+        use_intermesh = intermesh.is_intermesh_enabled(self._dag)
+
         async def on_recovery() -> None:
             """Re-setup networking after recovery (new node may have new IP)."""
             updated_handles = []
@@ -1100,7 +1104,7 @@ class JobController:
                 updated_handles.append((t, t_handle))
 
             await job_group_networking.setup_job_group_networking(
-                job_group_name, updated_handles)
+                job_group_name, updated_handles, use_intermesh=use_intermesh)
 
         return await self._monitor_one_task(
             task_id=task_id,
@@ -1318,10 +1322,15 @@ class JobController:
             if task_handle is not None:
                 tasks_handles.append((task, task_handle))
 
+        use_intermesh = intermesh.is_intermesh_enabled(self._dag)
+        if use_intermesh:
+            logger.info('Using Intermesh for cross-cloud networking')
+            logger.info('Jobs controller will be the mesh coordinator')
+
         if tasks_handles:
             networking_success = await (
                 job_group_networking.setup_job_group_networking(
-                    job_group_name, tasks_handles))
+                    job_group_name, tasks_handles, use_intermesh=use_intermesh))
             if not networking_success:
                 logger.warning(
                     'Some networking setup failed, continuing anyway')

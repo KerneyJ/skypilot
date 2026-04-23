@@ -1268,5 +1268,147 @@ class TestPrimaryAuxiliaryDagMethods:
         assert auxiliary == []
 
 
+class TestIntermeshConfig:
+    """Tests for Intermesh configuration in Job Groups."""
+
+    def test_load_job_group_with_intermesh_enabled(self):
+        """Test loading JobGroup with intermesh: enabled: true."""
+        yaml_content = """
+---
+name: intermesh-test
+execution: parallel
+intermesh:
+  enabled: true
+---
+name: server
+run: echo server
+---
+name: client
+run: echo client
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                         delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+
+            try:
+                dag = dag_utils.load_job_group_from_yaml(f.name)
+                assert dag.intermesh_config is not None
+                assert dag.intermesh_config.get('enabled') is True
+            finally:
+                os.unlink(f.name)
+
+    def test_load_job_group_with_intermesh_disabled(self):
+        """Test loading JobGroup with intermesh: enabled: false."""
+        yaml_content = """
+---
+name: no-intermesh
+execution: parallel
+intermesh:
+  enabled: false
+---
+name: job1
+run: echo job1
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                         delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+
+            try:
+                dag = dag_utils.load_job_group_from_yaml(f.name)
+                assert dag.intermesh_config is not None
+                assert dag.intermesh_config.get('enabled') is False
+            finally:
+                os.unlink(f.name)
+
+    def test_load_job_group_without_intermesh(self):
+        """Test loading JobGroup without intermesh config."""
+        yaml_content = """
+---
+name: default-group
+execution: parallel
+---
+name: job1
+run: echo job1
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                         delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+
+            try:
+                dag = dag_utils.load_job_group_from_yaml(f.name)
+                assert dag.intermesh_config is None
+            finally:
+                os.unlink(f.name)
+
+    def test_is_intermesh_enabled_with_dag(self):
+        """Test is_intermesh_enabled function with Dag object."""
+        from sky import intermesh
+
+        dag = dag_lib.Dag()
+
+        # No config
+        dag.intermesh_config = None
+        assert intermesh.is_intermesh_enabled(dag) is False
+
+        # Config with enabled=True
+        dag.intermesh_config = {'enabled': True}
+        assert intermesh.is_intermesh_enabled(dag) is True
+
+        # Config with enabled=False
+        dag.intermesh_config = {'enabled': False}
+        assert intermesh.is_intermesh_enabled(dag) is False
+
+        # Empty config
+        dag.intermesh_config = {}
+        assert intermesh.is_intermesh_enabled(dag) is False
+
+    def test_dump_job_group_with_intermesh(self):
+        """Test dumping JobGroup with intermesh config."""
+        dag = dag_lib.Dag()
+        dag.name = 'intermesh-roundtrip'
+        dag.set_execution(dag_lib.DagExecution.PARALLEL)
+        dag.intermesh_config = {'enabled': True}
+
+        task1 = task_lib.Task(name='server')
+        task1.set_resources(resources_lib.Resources())
+        task2 = task_lib.Task(name='client')
+        task2.set_resources(resources_lib.Resources())
+        dag.add(task1)
+        dag.add(task2)
+
+        # Serialize to YAML
+        yaml_str = dag_utils.dump_job_group_to_yaml_str(dag)
+
+        # Verify intermesh appears in YAML
+        assert 'intermesh' in yaml_str
+
+        # Reload and verify
+        reloaded = dag_utils.load_job_group_from_yaml_str(yaml_str)
+        assert reloaded.intermesh_config is not None
+        assert reloaded.intermesh_config.get('enabled') is True
+
+    def test_generate_wait_script_with_intermesh(self):
+        """Test wait script uses .sky.mesh hostnames when intermesh enabled."""
+        from sky.jobs import job_group_networking
+
+        # Without intermesh
+        script_no_intermesh = (
+            job_group_networking.generate_wait_for_networking_script(
+                'my-group', ['server', 'client'], use_intermesh=False))
+        assert 'server-0.my-group' in script_no_intermesh
+        assert 'client-0.my-group' in script_no_intermesh
+        assert '.sky.mesh' not in script_no_intermesh
+
+        # With intermesh
+        script_with_intermesh = (
+            job_group_networking.generate_wait_for_networking_script(
+                'my-group', ['server', 'client'], use_intermesh=True))
+        assert 'server-0.my-group.sky.mesh' in script_with_intermesh
+        assert 'client-0.my-group.sky.mesh' in script_with_intermesh
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

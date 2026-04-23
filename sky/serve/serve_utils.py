@@ -23,6 +23,7 @@ import filelock
 from sky import backends
 from sky import exceptions
 from sky import global_user_state
+from sky import intermesh
 from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
@@ -657,6 +658,55 @@ def terminate_replica(service_name: str, replica_id: int, purge: bool) -> str:
             raise ValueError(f'Failed to terminate replica {replica_id} '
                              f'in {service_name}. Reason:\n{message}')
     return message
+
+
+def configure_intermesh_for_service(service_name: str) -> str:
+    """Configures Intermesh on all replicas for a service.
+
+    This function runs on the controller and has access to replica handles
+    and cluster yamls.
+
+    Args:
+        service_name: Name of the service.
+
+    Returns:
+        A status message.
+    """
+    service_status = _get_service_status(service_name, pool=False)
+    if service_status is None:
+        raise ValueError(f'Service {service_name!r} does not exist.')
+
+    replica_infos = serve_state.get_replica_infos(service_name)
+    if not replica_infos:
+        return f'No replicas found for service {service_name!r}.'
+
+    success_count = 0
+    fail_count = 0
+    messages = []
+
+    for replica_info in replica_infos:
+        replica_id = replica_info.replica_id
+        handle = replica_info.handle()
+        if handle is None:
+            messages.append(f'Replica {replica_id}: handle is None, skipping')
+            fail_count += 1
+            continue
+
+        try:
+            if intermesh.configure_intermesh_replica(handle, replica_id,
+                                                     service_name):
+                logger.debug(f'Replica {replica_id}: configured successfully')
+                success_count += 1
+            else:
+                messages.append(f'Replica {replica_id}: configuration failed')
+                fail_count += 1
+        except Exception as e:  # pylint: disable=broad-except
+            messages.append(f'Replica {replica_id}: error - {e}')
+            fail_count += 1
+
+    logger.debug(f'Intermesh configuration complete for {service_name!r}: '
+                 f'{success_count} succeeded, {fail_count} failed.')
+    return '\n'.join(messages)
 
 
 def get_yaml_content(service_name: str, version: int) -> str:
@@ -1903,6 +1953,15 @@ class ServeCodeGen:
             f'kwargs={{}} if serve_version < 3 else {{"pool": {pool}}}',
             f'msg = serve_utils.update_service_encoded({service_name!r}, '
             f'{version}, mode={mode!r}, **kwargs)',
+            'print(msg, end="", flush=True)',
+        ]
+        return cls._build(code)
+
+    @classmethod
+    def configure_intermesh(cls, service_name: str) -> str:
+        code = [
+            f'msg = serve_utils.configure_intermesh_for_service('
+            f'{service_name!r})',
             'print(msg, end="", flush=True)',
         ]
         return cls._build(code)

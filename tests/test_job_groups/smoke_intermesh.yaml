@@ -1,0 +1,47 @@
+# JobGroup Intermesh smoke test - cross-cloud networking via Intermesh
+# This test verifies that tasks on different clouds can communicate
+# using the Intermesh mTLS mesh.
+---
+name: {{name}}
+execution: parallel
+intermesh:
+  enabled: true
+---
+name: server
+resources:
+  cpus: 2
+  cloud: aws
+  region: us-east-1
+run: |
+  echo "Server starting on $(hostname)"
+  python3 -m http.server 8080 &
+  SERVER_PID=$!
+  # Keep running for client to connect
+  sleep 120
+  kill $SERVER_PID 2>/dev/null || true
+  echo "Server done"
+---
+name: client
+resources:
+  cpus: 2
+  cloud: gcp
+  region: us-central1
+run: |
+  echo "Client starting, will connect to server on different cloud"
+  sleep 20  # Wait for server and intermesh setup
+
+  # Intermesh hostnames use .sky.mesh suffix
+  SERVER_HOST="server-0.${SKYPILOT_JOBGROUP_NAME}.sky.mesh"
+  echo "Testing connection to $SERVER_HOST:8080"
+
+  for i in $(seq 1 10); do
+    if curl -s --connect-timeout 5 http://$SERVER_HOST:8080/ > /dev/null 2>&1; then
+      echo "SUCCESS: Connected to server on AWS from GCP via Intermesh!"
+      exit 0
+    fi
+    echo "Attempt $i failed, retrying in 5s..."
+    sleep 5
+  done
+
+  echo "FAILED: Could not connect to server"
+  exit 1

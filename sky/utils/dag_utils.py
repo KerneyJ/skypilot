@@ -18,7 +18,7 @@ logger = sky_logging.init_logger(__name__)
 
 # JobGroup header fields
 _JOB_GROUP_HEADER_FIELDS = {
-    'name', 'execution', 'primary_tasks', 'termination_delay'
+    'name', 'execution', 'primary_tasks', 'termination_delay', 'intermesh'
 }
 _JOB_GROUP_REQUIRED_HEADER_FIELDS = {'name'}
 
@@ -629,6 +629,11 @@ def _load_job_group(
                     f'termination_delay must be a string, int, or dict, '
                     f'got {type(termination_delay).__name__}')
 
+    # Parse intermesh configuration for cross-cloud networking
+    intermesh_config = header.get('intermesh')
+    if intermesh_config is not None:
+        dag.intermesh_config = intermesh_config
+
     logger.info(f'Loaded JobGroup "{group_name}" with {len(dag.tasks)} jobs: '
                 f'{[t.name for t in dag.tasks]}')
 
@@ -677,6 +682,8 @@ def dump_job_group_to_yaml_str(dag: dag_lib.Dag,
         header['primary_tasks'] = dag.primary_tasks
     if dag.termination_delay is not None:
         header['termination_delay'] = dag.termination_delay
+    if dag.intermesh_config is not None:
+        header['intermesh'] = dag.intermesh_config
 
     # Build job configs
     configs: List[Dict[str, Any]] = [header]

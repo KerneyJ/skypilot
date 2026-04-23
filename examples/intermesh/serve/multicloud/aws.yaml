@@ -1,0 +1,21 @@
+# AWS-only service for multi-cloud testing
+#
+# Usage:
+#   sky serve up -n aws-service examples/serve/intermesh/multicloud/aws.yaml
+
+name: aws-service
+
+resources:
+  cloud: aws
+  region: us-east-1
+  cpus: 2
+  ports: 8080
+
+service:
+  replicas: 2
+  readiness_probe:
+    path: /
+    initial_delay_seconds: 10
+
+run: |
+  python -m http.server 8080

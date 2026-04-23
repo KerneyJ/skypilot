@@ -17,6 +17,7 @@ from sky import core
 from sky import exceptions
 from sky import execution
 from sky import global_user_state
+from sky import intermesh
 from sky import optimizer as optimizer_lib
 from sky import provision as provision_lib
 from sky import sky_logging
@@ -585,9 +586,11 @@ def launch(
                         override_params['region'] = best_region
                     task_.set_resources_override(override_params)
 
-        # Warn if job group is not running on Kubernetes (networking won't work)
+        # Warn if job group is not running on Kubernetes and intermesh is not
+        # enabled (networking won't work without one of these)
         first_task = dag.tasks[0]
-        if first_task.best_resources is not None:
+        use_intermesh = intermesh.is_intermesh_enabled(dag)
+        if first_task.best_resources is not None and not use_intermesh:
             best_cloud = first_task.best_resources.cloud
             if best_cloud is not None and str(
                     best_cloud).lower() != 'kubernetes':
@@ -595,8 +598,9 @@ def launch(
                     f'{colorama.Fore.YELLOW}Job group service discovery '
                     f'(hostname-based networking) is only supported on '
                     f'Kubernetes. Tasks will run on {best_cloud} but cannot '
-                    f'communicate with each other using hostnames.'
-                    f'{colorama.Style.RESET_ALL}')
+                    f'communicate with each other using hostnames. '
+                    f'Enable intermesh in the job group header to enable '
+                    f'cross-cloud networking.{colorama.Style.RESET_ALL}')
 
     # If there is a local postgres db, when the api server tries launching on
     # the remote jobs controller it will fail. therefore, we should remove this
@@ -888,6 +892,27 @@ def launch(
                     # here so we should just be able to use exec, but we need
                     # to work through the logic and make sure there is no issue
                     # with say file mounts.
+
+                    # Configure intermesh on controller for job groups
+                    if dag.is_job_group() and intermesh.is_intermesh_enabled(
+                            dag):
+                        logger.debug('[Intermesh] Installing on controller '
+                                     f'for job group {dag.name}')
+                        # Try to get existing handle first to avoid redundant
+                        # provisioning if controller is already up
+                        try:
+                            controller_handle = (
+                                backend_utils.is_controller_accessible(
+                                    controller=controller, stopped_message=''))
+                        except exceptions.ClusterNotUpError:
+                            controller_handle = _ensure_controller_up(
+                                controller,
+                                task_resources=sum(
+                                    [list(t.resources) for t in dag.tasks], []))
+                        with rich_utils.safe_status(
+                                '[cyan]Installing Intermesh[/]'):
+                            intermesh.configure_intermesh_controller(
+                                controller_handle)
 
                     # Job controller is not placed in kueue, as the
                     # controller pod is considered a "system" pod

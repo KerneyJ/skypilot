@@ -15,6 +15,7 @@ import filelock
 from sky import backends
 from sky import exceptions
 from sky import execution
+from sky import intermesh
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
@@ -412,6 +413,18 @@ def up(
                 'http://', '')
             endpoint = f'{protocol}://{socket_endpoint}'
 
+            # Install Intermesh on controller if enabled
+            if intermesh.is_intermesh_enabled(task):
+                logger.debug(f'[Intermesh] Installing on controller '
+                             f'for service {service_name}')
+                try:
+                    with rich_utils.safe_status(
+                            '[cyan]Installing Intermesh[/]'):
+                        intermesh.configure_intermesh_controller(
+                            controller_handle)
+                except RuntimeError as e:
+                    logger.error(f'[Intermesh] {e}')
+
         if pool:
             logger.info(
                 f'{fore.CYAN}Pool name: '
@@ -707,6 +720,66 @@ def apply(
         except exceptions.ClusterNotUpError:
             pass
         up(task, service_name, pool)
+
+
+def update_intermesh(service_name: str) -> None:
+    """Installs Intermesh on an existing service without restarting replicas."""
+    controller_type = controller_utils.get_controller_for_pool(pool=False)
+    handle = backend_utils.is_controller_accessible(
+        controller=controller_type,
+        stopped_message='Service controller is not running.',
+        non_existent_message='Service controller does not exist.',
+    )
+    assert isinstance(handle, backends.CloudVmRayResourceHandle)
+    backend = backend_utils.get_backend_from_handle(handle)
+    assert isinstance(backend, backends.CloudVmRayBackend)
+
+    # Verify service exists
+    service_record = _get_service_record(service_name, False, handle, backend)
+    if service_record is None:
+        with ux_utils.print_exception_no_traceback():
+            raise RuntimeError(f'Service {service_name!r} does not exist.')
+
+    # Create SSH runner for controller
+    ssh_credentials = backend_utils.ssh_credential_from_yaml(
+        handle.cluster_yaml, handle.docker_user, handle.ssh_user)
+    external_ips = handle.external_ips()
+    external_ssh_ports = handle.external_ssh_ports()
+    controller_runners = command_runner.SSHCommandRunner.make_runner_list(
+        zip(external_ips, external_ssh_ports), **ssh_credentials)
+    head_ip = external_ips[0]
+    head_runner = controller_runners[0]
+
+    with rich_utils.safe_status('[cyan]Installing Intermesh[/]'):
+        # 1. Install intermesh on controller
+        intermesh.install_intermesh(head_runner, head_ip)
+
+        # 2. Initialize mesh on controller
+        intermesh.initialize_mesh(controller_runners[0])
+
+        # 3. Configure each replica by running code on the controller
+        # This runs on the controller which has access to replica handles and
+        # cluster yamls needed for SSH connections
+        code = serve_utils.ServeCodeGen.configure_intermesh(service_name)
+        returncode, stdout, stderr = backend.run_on_head(handle,
+                                                         code,
+                                                         require_outputs=True,
+                                                         stream_logs=False,
+                                                         separate_stderr=True)
+
+        try:
+            subprocess_utils.handle_returncode(
+                returncode,
+                code,
+                'Failed to configure Intermesh on replicas',
+                stderr,
+                stream_logs=True)
+        except exceptions.CommandError as e:
+            raise RuntimeError(e.error_msg) from e
+
+    logger.debug(stdout)
+    logger.debug(
+        f'Intermesh installation complete for service {service_name!r}.')
 
 
 def down(

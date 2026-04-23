@@ -51,6 +51,22 @@ async def update(
     )
 
 
+@router.post('/update_intermesh')
+async def update_intermesh(
+    request: fastapi.Request,
+    update_intermesh_body: payloads.ServeUpdateIntermeshBody,
+) -> None:
+    await executor.schedule_request_async(
+        request_id=request.state.request_id,
+        request_name=request_names.RequestName.SERVE_UPDATE_INTERMESH,
+        request_body=update_intermesh_body,
+        func=core.update_intermesh,
+        schedule_type=api_requests.ScheduleType.SHORT,
+        request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
+        auth_user=request.state.auth_user,
+    )
+
+
 @router.post('/down')
 async def down(
     request: fastapi.Request,

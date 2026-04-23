@@ -864,6 +864,12 @@ class Task:
         # Handle the top-level config field
         config_override = config.pop('config', None)
 
+        # Handle the top-level intermesh field
+        intermesh_config = config.pop('intermesh', None)
+        if intermesh_config is not None:
+            config_override = config_override or {}
+            config_override['intermesh'] = intermesh_config
+
         # Store the final config override for use in resource setup
         cluster_config_override = config_override
 
